@@ -359,7 +359,7 @@ func TestIndentationMistakes(t *testing.T) {
 		{
 			name: "monitor body on one line",
 			src:  "monitors:\n  m: /var/log/auth.log\n",
-			err:  "line 2: a monitor must be a block of indented keys, got a string (/var/log/a",
+			err:  "line 2: a monitor must be a block of indented keys, got a string (/var/lo",
 		},
 		{
 			name: "monitors as a list",

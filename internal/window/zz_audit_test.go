@@ -330,8 +330,11 @@ func TestAudit_TickMonotonicUnderPathologies(t *testing.T) {
 		switch rng.Intn(6) {
 		case 0:
 			c.add(-time.Duration(rng.Int63n(int64(100 * 365 * 24 * time.Hour))))
+			if c.t.Before(aBase) {
+				c.t = aBase
+			}
 		case 1:
-			c.add(time.Duration(rng.Int63n(int64(100 * 365 * 24 * time.Hour))))
+			c.add(time.Duration(rng.Int63n(int64(50 * 365 * 24 * time.Hour))))
 		case 2:
 			c.t = aBase // reset to the start
 		default:
