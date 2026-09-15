@@ -1,0 +1,29 @@
+# Version control
+.git
+.gitignore
+
+# Build binaries and packaging output
+banhammer
+bin/
+dist/
+*.exe
+
+# Test artifacts and coverage
+test/
+*.test
+*.out
+coverage.*
+
+# Logs, sockets, and local state
+*.log
+*.sock
+
+# Temporary files, caches, and editor artifacts
+*.tmp
+*.bak
+*~
+*.swp
+*.swo
+.DS_Store
+.idea/
+.vscode/
