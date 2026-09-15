@@ -1,0 +1,41 @@
+[Unit]
+Description=Banhammer Intrusion Prevention Daemon
+Documentation=https://github.com/roigabay/banhammer
+After=network.target firewalld.service iptables.service nftables.service
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/banhammer run -c /etc/banhammer/config.yaml
+ExecReload=/usr/bin/banhammer reload
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=15s
+KillMode=mixed
+
+# Sandboxing & Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+# Sandboxed Directories
+StateDirectory=banhammer
+RuntimeDirectory=banhammer
+ConfigurationDirectory=banhammer
+
+# Capabilities for firewall control (iptables, nftables, ipset)
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+
+# Resource Limits
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
