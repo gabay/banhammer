@@ -186,9 +186,19 @@ counters map[netip.Addr]*counter   // per monitor
   (default 100k per monitor) with LRU drop so a spoofed-source UDP flood is bounded.
 * Windows use a **monotonic** clock base; only persisted state uses wall time.
 
-**Budget:** ~32 B map overhead + 24 B counter + 4 B×threshold ≈ **~80 B per tracked IP**.
-100k tracked IPs ≈ 8 MB worst case; a realistic host tracks a few hundred (≈ tens of KB).
-Go runtime baseline is ~5 MB ⇒ the **< 20 MB RSS** goal is comfortable.
+**Budget (measured, not estimated).** ~38 B Go map entry + 48 B slab entry (the `netip.Addr` is
+stored twice: once as the map key, once in the entry for O(1) eviction) + 8 B of LRU links +
+4 B×threshold of ticks ≈ **120 B per tracked IP**, independently measured at 100k IPs.
+100k tracked IPs ≈ 12 MB worst case; a realistic host tracks a few hundred (≈ tens of KB).
+Go runtime baseline is ~5 MB ⇒ the **< 20 MB RSS** goal holds, though a monitor deliberately
+configured with `max_tracked: 100000` under a spoofed-source flood will use most of that headroom.
+
+> [!NOTE]
+> The first draft of this document estimated ~80 B/IP. That figure omitted the LRU links and the
+> duplicated address key, which are what buy O(1) eviction. The important property — that memory
+> is **flat in hit volume** — was verified: one million hits against a single IP produce a heap
+> delta of zero.
+
 
 ### 4.5 Ban manager
 
