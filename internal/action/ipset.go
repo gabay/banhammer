@@ -40,8 +40,8 @@ type ipset struct {
 	t *iptables // reused for the static match-set rules and the v6 degradation
 }
 
-func newIPSet(b base) *ipset {
-	return &ipset{base: b, t: newIPTables(b)}
+func newIPSet(b base, chain string) *ipset {
+	return &ipset{base: b, t: newIPTables(b, chain)}
 }
 
 func (*ipset) Name() string { return "ipset" }
@@ -67,12 +67,12 @@ func (s *ipset) Start(ctx context.Context) error {
 	return nil
 }
 
-// matchRule installs "-m set --match-set <set> src -j DROP" in INPUT once.
+// matchRule installs "-m set --match-set <set> src -j DROP" in s.t.chain once.
 func (s *ipset) matchRule(ctx context.Context, x *xtables, set string) error {
 	x.setup = true
 	x.wait = s.t.probeWait(ctx, x)
 
-	rule := []string{"INPUT", "-m", "set", "--match-set", set, "src", "-j", "DROP"}
+	rule := []string{s.t.chain, "-m", "set", "--match-set", set, "src", "-j", "DROP"}
 	check := append([]string{"-t", "filter", "-C"}, rule...)
 	if _, err := s.exec(ctx, false, x.args(check...)...); err == nil {
 		x.ok = true
@@ -84,7 +84,7 @@ func (s *ipset) matchRule(ctx context.Context, x *xtables, set string) error {
 	if _, err := s.exec(ctx, false, x.args(insert...)...); err != nil {
 		return fmt.Errorf("inserting match-set rule via %s: %w", x.bin, err)
 	}
-	s.log.Info("installed match-set rule", "binary", x.bin, "set", set)
+	s.log.Info("installed match-set rule", "binary", x.bin, "chain", s.t.chain, "set", set)
 	x.ok = true
 	return nil
 }

@@ -345,3 +345,21 @@ func TestCmdPropagatesFailure(t *testing.T) {
 		t.Fatalf("ExitCode = %d, want 127 (error must stay unwrappable)", ExitCode(err))
 	}
 }
+
+func TestCmdChainVariable(t *testing.T) {
+	t.Parallel()
+	f := &fakeRunner{}
+	b, err := New(Spec{
+		Name:  "cmd",
+		Chain: "DOCKER-USER",
+		Ban:   "iptables -I {chain} -s {ip} -j DROP",
+		Unban: "iptables -D {chain} -s {ip} -j DROP",
+	}, f, discardLogger())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := b.Ban(context.Background(), testBan(t, "203.0.113.7")); err != nil {
+		t.Fatalf("Ban: %v", err)
+	}
+	requireArgv(t, f.last(t), []string{"iptables", "-I", "DOCKER-USER", "-s", "203.0.113.7", "-j", "DROP"})
+}

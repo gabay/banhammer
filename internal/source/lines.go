@@ -13,7 +13,8 @@ type splitter struct {
 	max       int    // longest line emitted; 0 means maxLineBytes
 	carry     []byte // bytes of an incomplete line seen so far
 	discard   bool   // swallowing the tail of an over-long line
-	truncated uint64 // over-long lines emitted truncated, for logging
+	truncated uint64 // over-long lines emitted truncated, since creation
+	reported  uint64 // value of truncated at the last takeTruncated
 }
 
 func (s *splitter) limit() int {
@@ -42,7 +43,11 @@ func (s *splitter) push(chunk []byte, emit func([]byte) error) error {
 		if i < 0 {
 			// Incomplete line: hold it until the newline arrives.
 			s.carry = append(s.carry, chunk...)
-			if len(s.carry) >= max {
+			// Strictly greater, exactly as on the newline path below: a
+			// line of exactly max bytes is *not* over-long, and treating it
+			// as such here would also swallow its newline as the start of
+			// the discarded tail, corrupting the following line.
+			if len(s.carry) > max {
 				// Over-long and still no newline. Emit the head so
 				// a match cannot be hidden behind padding, then
 				// swallow the rest of the line.
@@ -96,6 +101,16 @@ func (s *splitter) flush(emit func([]byte) error) error {
 // tailer subtracts it from the file offset so a checkpoint always lands on a
 // line boundary and a restart re-reads the partial line rather than losing it.
 func (s *splitter) pending() int { return len(s.carry) }
+
+// takeTruncated returns how many lines have been truncated since the previous
+// call. It is a delta rather than a total because the caller aggregates across
+// splitters (one per connection, one per tailed file) into a single counter,
+// and because reading it must be cheap enough to do after every pump.
+func (s *splitter) takeTruncated() uint64 {
+	n := s.truncated - s.reported
+	s.reported = s.truncated
+	return n
+}
 
 // reset drops buffered state, used when the underlying file is replaced or
 // truncated and the partial line can never be completed.

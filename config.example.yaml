@@ -1,17 +1,28 @@
 # Banhammer example configuration.
-# Everything below except `monitors:` is optional — the defaults shown are the built-in ones.
+# Everything below except `monitors:` is optional — the defaults shown are the
+# built-in ones, so a commented-out line and the line uncommented behave alike.
 
 # ---------------------------------------------------------------- global
 state_dir: /var/lib/banhammer      # bans.json + offsets.json live here
 log_format: text                   # text | json
+# queue_size: 8192                 # events buffered between readers and workers;
+                                   # overflow increments lines_dropped
 
 defaults:
   threshold: 5                     # X: hits required to trigger a ban
   window: 10m                      # Y: ...within this rolling window
   bantime: 1h                      # Z: ...then unban after this long
-  action: iptables                 # iptables | ipset | nft | dryrun | <inline cmd block>
+  action: iptables                 # iptables | ipset | nft | dryrun | <inline block>
+  # action:                        # use block syntax to customize chain or timeout:
+  #   name: iptables               # iptables | ipset | nft | dryrun
+  #   chain: INPUT                 # INPUT (default) | DOCKER-USER (for Docker hosts) | FORWARD | ...
+  #   timeout: 10s
   start_at: checkpoint             # checkpoint | end | beginning
   on_repeat: ignore                # ignore | extend  (behaviour when an already-banned IP re-offends)
+  # bantime_factor: 1              # multiply bantime by this per prior offense (1 = no escalation)
+  # bantime_max: 168h              # ceiling for an escalated bantime
+  # find_history: 24h              # how long prior offenses count towards escalation
+  # max_tracked: 100000            # LRU cap on tracked IPs, per monitor
 
 allow_local: true                  # never ban loopback or this host's own addresses
 allowlist:
@@ -21,7 +32,7 @@ allowlist:
   - 192.168.0.0/16
 
 # metrics:
-#   listen: 127.0.0.1:9777         # Prometheus endpoint; omit to disable
+#   listen: 127.0.0.1:9777         # Prometheus endpoint (/metrics, /healthz); omit to disable
 
 # ---------------------------------------------------------------- monitors
 monitors:
@@ -30,6 +41,9 @@ monitors:
   sshd:
     file: /var/log/auth.log
     match: "Failed password .* from <IP>"
+    # contains: "Failed password"   # literal prefilter; derived from the regex
+                                    # when omitted, set it only when that guess
+                                    # is wrong (e.g. an alternation)
 
   # Multiple patterns (OR), plus an exception.
   sshd-strict:

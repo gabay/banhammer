@@ -71,6 +71,23 @@ func TestSplitterPush(t *testing.T) {
 			wantTrunc: 0,
 		},
 		{
+			// The no-newline path used to truncate at >= max, so this line
+			// was reported truncated and its newline was swallowed as the
+			// start of the discarded tail — taking "bb" with it.
+			name:      "line exactly at the limit split across chunks",
+			max:       4,
+			chunks:    []string{"abcd", "\nbb\n"},
+			want:      []string{"abcd", "bb"},
+			wantTrunc: 0,
+		},
+		{
+			name:      "one byte over the limit is truncated",
+			max:       4,
+			chunks:    []string{"abcde", "\nbb\n"},
+			want:      []string{"abcd", "bb"},
+			wantTrunc: 1,
+		},
+		{
 			name:   "no data",
 			chunks: []string{""},
 			want:   nil,
@@ -175,6 +192,120 @@ func TestSplitterPropagatesEmitError(t *testing.T) {
 	}
 	if n != 1 {
 		t.Fatalf("emit called %d times, want 1 (push must stop at the first error)", n)
+	}
+}
+
+// splitAll runs data through a splitter in chunks of size n (plus a final
+// flush) and returns the lines it emitted.
+func splitAll(data []byte, n int) []string {
+	sp := splitter{max: maxLineBytes}
+	var got []string
+	emit := func(line []byte) error {
+		got = append(got, string(line))
+		return nil
+	}
+	for len(data) > 0 {
+		c := min(n, len(data))
+		_ = sp.push(data[:c], emit) // emit never fails here
+		data = data[c:]
+	}
+	_ = sp.flush(emit)
+	return got
+}
+
+// wantLines is the reference implementation: split on newlines, drop the empty
+// remainder after a trailing newline, trim CR. It is what bytes.Split would
+// give a caller who had the whole stream in memory at once, which is exactly
+// the property the splitter exists to preserve for a caller who does not.
+func wantLines(data []byte) []string {
+	if len(data) == 0 {
+		return nil
+	}
+	parts := bytes.Split(data, []byte("\n"))
+	if len(parts[len(parts)-1]) == 0 {
+		parts = parts[:len(parts)-1]
+	}
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		out = append(out, string(trimCR(p)))
+	}
+	return out
+}
+
+// Chunk boundaries are an accident of the network and the filesystem, so the
+// splitter's output must not depend on them at all.
+func TestSplitterIsIndependentOfChunkBoundaries(t *testing.T) {
+	t.Parallel()
+	inputs := []string{
+		"",
+		"\n",
+		"a\nb\nc\n",
+		"a\nb\nc",
+		"no newline at all",
+		"\n\n\n",
+		"crlf\r\nand\r\nmore\r\n",
+		"trailing\rcr\n",
+		"Failed password for root from 10.0.0.1 port 22\nAccepted publickey for alice\n",
+		"\x00binary\xff\ndata\n",
+	}
+	for _, in := range inputs {
+		t.Run(in, func(t *testing.T) {
+			t.Parallel()
+			data := []byte(in)
+			want := wantLines(data)
+			for n := 1; n <= len(data)+1; n++ {
+				if got := splitAll(data, n); !equalStrings(got, want) {
+					t.Fatalf("chunk size %d: lines = %q, want %q", n, got, want)
+				}
+			}
+		})
+	}
+}
+
+// FuzzSplitterPush asserts the same property on arbitrary input: reassembling
+// a byte stream cut at an arbitrary point must equal splitting it whole.
+func FuzzSplitterPush(f *testing.F) {
+	f.Add([]byte("a\nb\n"), uint8(1))
+	f.Add([]byte("partial"), uint8(3))
+	f.Add([]byte("\r\n\r\n"), uint8(2))
+	f.Add([]byte("one\ntwo\nthree"), uint8(7))
+	f.Fuzz(func(t *testing.T, data []byte, chunk uint8) {
+		got := splitAll(data, int(chunk)+1)
+		if want := wantLines(data); !equalStrings(got, want) {
+			t.Fatalf("chunk size %d: lines = %q, want %q", int(chunk)+1, got, want)
+		}
+	})
+}
+
+// takeTruncated is how a source moves the count into its own stats, so it has
+// to report each truncation exactly once.
+func TestSplitterTakeTruncated(t *testing.T) {
+	t.Parallel()
+	sp := splitter{max: 2}
+	emit := func([]byte) error { return nil }
+
+	if n := sp.takeTruncated(); n != 0 {
+		t.Errorf("fresh splitter reported %d truncations, want 0", n)
+	}
+	if err := sp.push([]byte("aaaa\nbbbb\n"), emit); err != nil {
+		t.Fatal(err)
+	}
+	if n := sp.takeTruncated(); n != 2 {
+		t.Errorf("takeTruncated = %d, want 2", n)
+	}
+	if n := sp.takeTruncated(); n != 0 {
+		t.Errorf("second takeTruncated = %d, want 0 (a delta, not a total)", n)
+	}
+	if err := sp.push([]byte("cccc\n"), emit); err != nil {
+		t.Fatal(err)
+	}
+	if n := sp.takeTruncated(); n != 1 {
+		t.Errorf("takeTruncated after one more = %d, want 1", n)
+	}
+	// reset clears buffered bytes, not statistics.
+	sp.reset()
+	if sp.truncated != 3 {
+		t.Errorf("total truncated = %d, want 3 preserved across reset", sp.truncated)
 	}
 }
 

@@ -369,12 +369,18 @@ func TestPipeline_EndToEnd_JSON(t *testing.T) {
 	}
 
 	cancel()
-	_ = <-runErrCh
+	if err := <-runErrCh; err != nil {
+		t.Errorf("daemon Run returned %v, want nil after cancellation", err)
+	}
 }
 
 // TestPipeline_Allocations_NonMatching verifies the PROJECT.md §7 guarantee:
 // allocations per line must be 0 on the non-matching path.
 func TestPipeline_Allocations_NonMatching(t *testing.T) {
+	if raceEnabled {
+		t.Skip("race instrumentation adds its own allocations; see race_test.go")
+	}
+
 	authSet := compileAuthRuleSet()
 	jsonSet := compileJSONRuleSet()
 
@@ -445,7 +451,6 @@ func benchmarkPipelineCorpus(b *testing.B, corpus [][]byte, set *rule.Set, track
 	nLines := len(corpus)
 	b.ReportAllocs()
 	b.ResetTimer()
-	start := time.Now()
 
 	for i := 0; i < b.N; i++ {
 		line := corpus[i%nLines]
@@ -455,8 +460,9 @@ func benchmarkPipelineCorpus(b *testing.B, corpus [][]byte, set *rule.Set, track
 		}
 	}
 
-	elapsed := time.Since(start).Seconds()
-	if elapsed > 0 {
+	// b.Elapsed rather than a hand-rolled time.Since: it excludes the time the
+	// framework paused the clock for, so the rate matches the ns/op it prints.
+	if elapsed := b.Elapsed().Seconds(); elapsed > 0 {
 		b.ReportMetric(float64(b.N)/elapsed, "lines/sec")
 	}
 }

@@ -187,18 +187,31 @@ func TestAddrRoundTripThroughStore(t *testing.T) {
 
 // FuzzStateFiles asserts the central robustness property: whatever bytes are
 // on disk, the store starts, never panics, and never reports the state files
-// as a fatal error.
+// as a fatal error. The two files get their own input because they are read on
+// different paths — offsets.json inside Open, bans.json on demand — and the
+// interesting cases are the mixed ones: a good file next to a broken one.
 func FuzzStateFiles(f *testing.F) {
-	f.Add([]byte(""))
-	f.Add([]byte("{"))
-	f.Add([]byte(`{"version":1,"bans":[{"ip":"1.2.3.4"`))
-	f.Add([]byte(`{"version":1,"bans":[{"ip":"nonsense","at":"not-a-time"}]}`))
-	f.Add([]byte(`{"version":1,"offsets":{"/a":{"path":"/a","offset":-1}}}`))
-	f.Add([]byte("\x00\x01\x02\xff"))
+	corpus := []string{
+		"",
+		"{",
+		`{"version":1,"bans":[{"ip":"1.2.3.4"`,
+		`{"version":1,"bans":[{"ip":"nonsense","at":"not-a-time"}]}`,
+		`{"version":1,"bans":[{"ip":"1.2.3.4","at":"2024-01-02T00:00:00Z","until":"2024-01-01T00:00:00Z"}]}`,
+		`{"version":1,"offsets":{"/a":{"path":"/a","offset":-1}}}`,
+		`{"version":1,"offsets":{"/a":{"path":"/a","offset":1},"b":{"path":"/a","offset":2}}}`,
+		`{"version":99,"bans":[]}`,
+		"\x00\x01\x02\xff",
+	}
+	for i, bans := range corpus {
+		// Pair every input with itself and with the next one, so the seeds
+		// cover both files being broken and only one of them.
+		f.Add([]byte(bans), []byte(bans))
+		f.Add([]byte(bans), []byte(corpus[(i+1)%len(corpus)]))
+	}
 
-	f.Fuzz(func(t *testing.T, data []byte) {
+	f.Fuzz(func(t *testing.T, bansData, offsetsData []byte) {
 		dir := t.TempDir()
-		for _, name := range []string{BansFile, OffsetsFile} {
+		for name, data := range map[string][]byte{BansFile: bansData, OffsetsFile: offsetsData} {
 			if err := os.WriteFile(filepath.Join(dir, name), data, 0o644); err != nil {
 				t.Fatalf("seed %s: %v", name, err)
 			}
@@ -217,15 +230,27 @@ func FuzzStateFiles(f *testing.F) {
 			if !b.IP.IsValid() {
 				t.Fatalf("LoadBans returned an invalid address: %+v", b)
 			}
+			if b.Until.Before(b.At) {
+				t.Fatalf("LoadBans returned a ban that expires before it started: %+v", b)
+			}
 		}
-		if _, err := s.LoadOffsets(); err != nil {
+		offsets, err := s.LoadOffsets()
+		if err != nil {
 			t.Fatalf("LoadOffsets: %v", err)
+		}
+		for k, cp := range offsets {
+			if cp.Offset < 0 {
+				t.Fatalf("LoadOffsets returned a negative offset for %q: %+v", k, cp)
+			}
 		}
 		s.Lookup("/var/log/auth.log")
 
 		// Whatever happened, the store must still be writable.
 		if err := s.SaveBans(bans); err != nil {
 			t.Fatalf("SaveBans: %v", err)
+		}
+		if err := s.SaveOffsets(offsets); err != nil {
+			t.Fatalf("SaveOffsets: %v", err)
 		}
 		if err := s.Flush(); err != nil {
 			t.Fatalf("Flush: %v", err)

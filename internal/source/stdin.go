@@ -22,9 +22,13 @@ const stdinReadSlice = 200 * time.Millisecond
 //
 // If r supports read deadlines (a pipe or socket opened as an *os.File does),
 // cancellation is prompt and the reader goroutine is always joined. For a
-// reader without deadlines, Run still returns immediately on cancellation, but
-// a goroutine may remain parked inside a blocking Read until that read returns
-// — there is no portable way to interrupt a reader we do not own.
+// reader without deadlines — including a redirected file, which fails
+// SetReadDeadline with ErrNoDeadline — Run still returns immediately on
+// cancellation, but a goroutine may remain parked inside a blocking Read until
+// that read returns; there is no portable way to interrupt a reader we do not
+// own. That goroutine can no longer reach the caller's channel once Run has
+// returned: it emits through an internal relay (see Run), so the caller is
+// free to close out the moment Run returns.
 func NewStdin(monitor string, r io.Reader, log *slog.Logger) (Source, error) {
 	if monitor == "" {
 		return nil, errors.New("stdin: monitor name is empty")
@@ -43,12 +47,16 @@ type stdinSource struct {
 	monitor string
 	r       io.Reader
 	log     *slog.Logger
+	stats   sourceStats
 }
 
 func (s *stdinSource) Name() string { return s.monitor }
 
 // Checkpoints returns nil: a pipe has no resumable position.
 func (s *stdinSource) Checkpoints() []model.Checkpoint { return nil }
+
+// Stats reports over-long lines truncated on the way through.
+func (s *stdinSource) Stats() Stats { return s.stats.snapshot() }
 
 // deadlineReader is implemented by *os.File on pipes, ttys and sockets.
 type deadlineReader interface {
@@ -69,16 +77,38 @@ func (s *stdinSource) Run(ctx context.Context, out chan<- model.Event) error {
 			}
 		}
 	}
-	// Fallback: the read cannot be interrupted, so it runs in a goroutine and
-	// Run abandons it on cancellation (see NewStdin).
+	// Fallback: the read cannot be interrupted, so it runs in a goroutine that
+	// Run abandons on cancellation (see NewStdin).
+	//
+	// That goroutine must never touch the caller's channel. daemon/pipeline.go
+	// closes it the instant Run returns, so a line that arrives from the
+	// abandoned read a moment later would be a send on a closed channel — a
+	// panic that takes the whole daemon down at shutdown. `banhammer run
+	// --stdin < auth.log` takes exactly this path, because a regular *os.File
+	// fails SetReadDeadline with ErrNoDeadline.
+	//
+	// So the reader emits into relay, which only Run forwards from. Once Run
+	// has returned nobody receives, and the abandoned emit falls out on
+	// ctx.Done instead of blocking forever. relay is unbuffered on purpose: a
+	// buffered event would be one the reader believes it delivered and the
+	// pipeline never sees.
+	relay := make(chan model.Event)
 	done := make(chan error, 1)
-	go func() { done <- s.readLoop(ctx, s.r, out, false) }()
-	select {
-	case err := <-done:
-		return err
-	case <-ctx.Done():
-		s.log.Debug("cancelled with a read in flight; the reader goroutine exits when that read returns")
-		return nil
+	go func() { done <- s.readLoop(ctx, s.r, relay, false) }()
+	for {
+		select {
+		case err := <-done:
+			return err
+		case ev := <-relay:
+			select {
+			case out <- ev:
+			case <-ctx.Done():
+				return nil
+			}
+		case <-ctx.Done():
+			s.log.Debug("cancelled with a read in flight; the reader goroutine exits when that read returns")
+			return nil
+		}
 	}
 }
 
@@ -87,6 +117,10 @@ func (s *stdinSource) readLoop(ctx context.Context, r io.Reader, out chan<- mode
 	emit := func(line []byte) error { return em.emit(ctx, line) }
 	sp := splitter{max: maxLineBytes}
 	buf := make([]byte, connReadChunk)
+	// Truncations are banked on the way out as well as after every read: a
+	// `journalctl -f | banhammer run` pipe never reaches EOF, so counting only
+	// there (as this used to) loses the count on every shutdown.
+	defer s.stats.noteSplitter(s.log, &sp)
 
 	for {
 		if deadlines {
@@ -97,7 +131,9 @@ func (s *stdinSource) readLoop(ctx context.Context, r io.Reader, out chan<- mode
 		}
 		n, err := r.Read(buf)
 		if n > 0 {
-			if perr := sp.push(buf[:n], emit); perr != nil {
+			perr := sp.push(buf[:n], emit)
+			s.stats.noteSplitter(s.log, &sp)
+			if perr != nil {
 				return nil // context cancelled
 			}
 		}
@@ -112,9 +148,6 @@ func (s *stdinSource) readLoop(ctx context.Context, r io.Reader, out chan<- mode
 				// EOF on a pipe is authoritative: emit any trailing line.
 				if ferr := sp.flush(emit); ferr != nil {
 					return nil
-				}
-				if sp.truncated > 0 {
-					s.log.Warn("over-long lines were truncated", "count", sp.truncated, "max", maxLineBytes)
 				}
 				s.log.Info("stdin closed")
 				return nil

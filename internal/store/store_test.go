@@ -16,25 +16,6 @@ import (
 	"banhammer/internal/model"
 )
 
-func mustAddr(t *testing.T, s string) netip.Addr {
-	t.Helper()
-	a, err := netip.ParseAddr(s)
-	if err != nil {
-		t.Fatalf("ParseAddr(%q): %v", s, err)
-	}
-	return a
-}
-
-func sampleBans(t *testing.T) []model.Ban {
-	t.Helper()
-	at := time.Date(2024, 2, 29, 23, 59, 58, 123456789, time.FixedZone("IST", 2*3600))
-	return []model.Ban{
-		{IP: mustAddr(t, "1.2.3.4"), Monitor: "sshd", At: at, Until: at.Add(time.Hour), Count: 5, Offense: 1},
-		{IP: mustAddr(t, "2001:db8::dead:beef"), Monitor: "nginx", At: at.UTC(), Until: at.UTC().Add(48 * time.Hour), Count: 12, Offense: 3},
-		{IP: mustAddr(t, "::ffff:10.0.0.9"), Monitor: "postfix", At: at, Until: at.Add(time.Minute), Count: 1, Offense: 1},
-	}
-}
-
 func TestOpenCreatesDirectory(t *testing.T) {
 	t.Parallel()
 	dir := filepath.Join(t.TempDir(), "nested", "state")
@@ -182,32 +163,6 @@ func TestSaveLoadBansRoundTrip(t *testing.T) {
 		t.Fatalf("LoadBans: %v", err)
 	}
 	assertBansEqual(t, got, want)
-}
-
-func assertBansEqual(t *testing.T, got, want []model.Ban) {
-	t.Helper()
-	if len(got) != len(want) {
-		t.Fatalf("got %d bans, want %d (%v)", len(got), len(want), got)
-	}
-	for i := range want {
-		g, w := got[i], want[i]
-		if g.IP != w.IP || g.Monitor != w.Monitor || g.Count != w.Count || g.Offense != w.Offense {
-			t.Errorf("ban %d = %+v, want %+v", i, g, w)
-		}
-		assertTimeEqual(t, fmt.Sprintf("ban %d At", i), g.At, w.At)
-		assertTimeEqual(t, fmt.Sprintf("ban %d Until", i), g.Until, w.Until)
-	}
-}
-
-func assertTimeEqual(t *testing.T, what string, got, want time.Time) {
-	t.Helper()
-	if !got.Equal(want) {
-		t.Errorf("%s = %v, want %v", what, got, want)
-	}
-	if got.Format(time.RFC3339Nano) != want.Format(time.RFC3339Nano) {
-		t.Errorf("%s zone offset lost: %s vs %s", what,
-			got.Format(time.RFC3339Nano), want.Format(time.RFC3339Nano))
-	}
 }
 
 func TestSaveBansEmptySliceRoundTrips(t *testing.T) {
@@ -616,21 +571,6 @@ func TestCorruptStateFiles(t *testing.T) {
 	}
 }
 
-// assertQuarantined checks the evidence was preserved, not deleted.
-func assertQuarantined(t *testing.T, dir, base, want string) {
-	t.Helper()
-	if _, err := os.Stat(filepath.Join(dir, base)); !errors.Is(err, os.ErrNotExist) {
-		t.Errorf("%s still present after quarantine (err=%v)", base, err)
-	}
-	got, err := os.ReadFile(filepath.Join(dir, base+CorruptSuffix))
-	if err != nil {
-		t.Fatalf("corrupt file not preserved: %v", err)
-	}
-	if string(got) != want {
-		t.Errorf("quarantined content = %q, want the original %q", got, want)
-	}
-}
-
 func TestQuarantineOverwritesPreviousCorruptFile(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
@@ -727,6 +667,15 @@ func TestOperationsAfterClose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
+	// Seed a checkpoint *before* closing: asserting on a store that never had
+	// any offsets would pass whether or not Lookup checks s.closed at all.
+	const path = "/var/log/auth.log"
+	if err := s.SaveOffsets(map[string]model.Checkpoint{path: {Path: path, Offset: 4096}}); err != nil {
+		t.Fatalf("SaveOffsets: %v", err)
+	}
+	if _, ok := s.Lookup(path); !ok {
+		t.Fatalf("Lookup(%q) before Close = not found", path)
+	}
 	if err := s.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
@@ -749,20 +698,21 @@ func TestOperationsAfterClose(t *testing.T) {
 		t.Errorf("Flush = %v, want ErrClosed", err)
 	}
 
+	// Reading is no safer than writing: the directory may now belong to
+	// another daemon that has since moved this very checkpoint on, so handing
+	// the remembered value to a source would rewind or skip its log.
+	if cp, ok := s.Lookup(path); ok {
+		t.Errorf("Lookup after Close = %+v, found; want a closed store to report nothing", cp)
+	}
 	if _, ok := s.Lookup("/x"); ok {
-		t.Error("Lookup after Close reported found")
+		t.Error("Lookup of an unknown path after Close reported found")
 	}
 }
 
 func TestCloseFlushesPendingBans(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	clk := newFakeClock()
-	sched := &fakeScheduler{}
-	s, err := OpenWith(dir, Options{Log: discardLogger(), Now: clk.Now, AfterFunc: sched.AfterFunc})
-	if err != nil {
-		t.Fatalf("OpenWith: %v", err)
-	}
+	s, _, _, _ := newTestStore(t, dir)
 	want := sampleBans(t)
 	if err := s.SaveBans(want); err != nil {
 		t.Fatalf("SaveBans: %v", err)
@@ -786,16 +736,407 @@ func TestCloseFlushesPendingBans(t *testing.T) {
 func TestSynchronousMode(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	s, err := OpenWith(dir, Options{Log: discardLogger(), BanInterval: -1})
-	if err != nil {
-		t.Fatalf("OpenWith: %v", err)
-	}
-	defer s.Close() //nolint:errcheck // nothing pending in synchronous mode
+	s, _, sched, _ := newTestStore(t, dir, func(o *Options) { o.SynchronousBans = true })
 	if err := s.SaveBans(sampleBans(t)); err != nil {
 		t.Fatalf("SaveBans: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(dir, BansFile)); err != nil {
 		t.Fatalf("synchronous save did not hit the disk: %v", err)
+	}
+	// Synchronous means synchronous: no timer may be left holding state.
+	if n := sched.count(); n != 0 {
+		t.Errorf("scheduled %d timers in synchronous mode, want 0", n)
+	}
+}
+
+func TestOpenRejectsNegativeBanInterval(t *testing.T) {
+	t.Parallel()
+	// A negative interval used to mean "synchronous". That meaning now has a
+	// name of its own, so the nonsensical value must be refused rather than
+	// silently reinterpreted.
+	_, err := OpenWith(t.TempDir(), Options{Log: discardLogger(), BanInterval: -time.Second})
+	if err == nil {
+		t.Fatal("OpenWith accepted a negative BanInterval")
+	}
+	if !strings.Contains(err.Error(), "SynchronousBans") {
+		t.Errorf("error = %v, want it to point at SynchronousBans", err)
+	}
+}
+
+// TestDebouncedWriteWaitsOutTheIntervalEvenIfTheTimerIsEarly pins the rate
+// limit in the writer rather than in the scheduler. A timer armed before the
+// most recent write can come due immediately after it; if the callback simply
+// wrote, two writes would land inside one interval no matter how carefully
+// the timers were armed.
+func TestDebouncedWriteWaitsOutTheIntervalEvenIfTheTimerIsEarly(t *testing.T) {
+	t.Parallel()
+	s, clk, sched, rec := newTestStore(t, t.TempDir())
+
+	if err := s.SaveBans(sampleBans(t)[:1]); err != nil {
+		t.Fatalf("SaveBans: %v", err)
+	}
+	if n := sched.fireAll(); n != 1 {
+		t.Fatalf("fired %d timers, want 1", n)
+	}
+	if got := rec.countFor(BansFile); got != 1 {
+		t.Fatalf("writes = %d, want 1", got)
+	}
+
+	// Second save, then fire its timer without letting any time pass — the
+	// early wake-up a stopped-too-late timer produces in production.
+	if err := s.SaveBans(sampleBans(t)[:2]); err != nil {
+		t.Fatalf("SaveBans: %v", err)
+	}
+	if n := sched.fireAll(); n != 1 {
+		t.Fatalf("fired %d timers, want 1", n)
+	}
+	if got := rec.countFor(BansFile); got != 1 {
+		t.Errorf("writes = %d, want the early timer to re-arm instead of writing", got)
+	}
+	if d := sched.lastDelay(t); d != DefaultBanInterval {
+		t.Errorf("re-armed delay = %v, want the %v left of the interval", d, DefaultBanInterval)
+	}
+
+	clk.Advance(DefaultBanInterval)
+	if n := sched.fireAll(); n != 1 {
+		t.Fatalf("fired %d timers, want 1", n)
+	}
+	if got := rec.countFor(BansFile); got != 2 {
+		t.Errorf("writes = %d, want 2 once the interval has elapsed", got)
+	}
+	got, err := s.LoadBans()
+	if err != nil {
+		t.Fatalf("LoadBans: %v", err)
+	}
+	if len(got) != 2 {
+		t.Errorf("persisted %d bans, want the 2 of the second save", len(got))
+	}
+}
+
+// TestStaleDebounceTimerDoesNotWriteOrOrphanItsSuccessor drives the one
+// interleaving a fake scheduler cannot produce, so it needs a real timer: T1
+// fires and parks on the mutex; Flush holds the mutex, so its Stop() comes too
+// late and reports false, and it writes; a save then arms T2. When T1 finally
+// gets the mutex it must do nothing at all — writing would be a second write
+// inside one interval, and clearing s.timer would orphan T2 along with the
+// state it is supposed to persist.
+func TestStaleDebounceTimerDoesNotWriteOrOrphanItsSuccessor(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+
+	var mu sync.Mutex
+	timers := 0
+	fired := make(chan struct{})   // T1's callback has started
+	release := make(chan struct{}) // ... and may now enter the store
+	done := make(chan struct{})    // ... and has returned
+	realTimers := func(d time.Duration, f func()) Stopper {
+		mu.Lock()
+		first := timers == 0
+		timers++
+		mu.Unlock()
+		if !first {
+			return time.AfterFunc(d, f)
+		}
+		return time.AfterFunc(d, func() {
+			close(fired)
+			<-release
+			f()
+			close(done)
+		})
+	}
+
+	s, _, _, rec := newTestStore(t, dir, func(o *Options) {
+		o.Now = time.Now // a real timer wants the clock it is scheduled against
+		o.BanInterval = time.Millisecond
+		o.AfterFunc = realTimers
+	})
+
+	// Nothing has been written yet, so T1 is armed for "now".
+	if err := s.SaveBans(sampleBans(t)[:1]); err != nil {
+		t.Fatalf("SaveBans: %v", err)
+	}
+	<-fired
+
+	s.mu.Lock()
+	close(release) // T1 can only block on the mutex we hold
+	if s.timer.Stop() {
+		t.Fatal("Stop() reported success for a timer that has already fired")
+	}
+	// What Flush does while holding the mutex.
+	if err := s.flushLocked(); err != nil {
+		t.Fatalf("flushLocked: %v", err)
+	}
+	// What the SaveBans right after it does: new state, new timer. An hour,
+	// so the assertions below never depend on T2 firing.
+	s.pendingBans = sampleBans(t)
+	s.hasPending = true
+	s.armTimerLocked(time.Hour)
+	t2 := s.timer
+	s.mu.Unlock()
+
+	<-done // the stale callback has run to completion
+
+	if got := rec.countFor(BansFile); got != 1 {
+		t.Errorf("writes = %d, want 1: the stale timer wrote a second time inside one interval", got)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.timer != t2 {
+		t.Errorf("timer = %v, want the one armed after the flush; the stale callback orphaned it", s.timer)
+	}
+	if !s.hasPending {
+		t.Error("the stale callback consumed state it was not allowed to write")
+	}
+}
+
+// TestRealTimersSurviveConcurrentSavesAndFlushes is the -race exerciser for
+// the same code path: real timers, a 1ms interval, and saves racing flushes.
+func TestRealTimersSurviveConcurrentSavesAndFlushes(t *testing.T) {
+	t.Parallel()
+	s, _, _, _ := newTestStore(t, t.TempDir(), func(o *Options) {
+		o.Now = time.Now
+		o.BanInterval = time.Millisecond
+		o.AfterFunc = nil // the real time.AfterFunc
+	})
+
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				ip := netip.AddrFrom4([4]byte{10, byte(i), byte(j), 1})
+				if err := s.SaveBans([]model.Ban{{IP: ip, Monitor: "m", Count: j}}); err != nil {
+					t.Errorf("SaveBans: %v", err)
+					return
+				}
+				if j%10 == 0 {
+					if err := s.Flush(); err != nil {
+						t.Errorf("Flush: %v", err)
+						return
+					}
+				}
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	want := sampleBans(t)[:1]
+	if err := s.SaveBans(want); err != nil {
+		t.Fatalf("final SaveBans: %v", err)
+	}
+	if err := s.Flush(); err != nil {
+		t.Fatalf("final Flush: %v", err)
+	}
+	// Read through the file: a timer still in flight must not resurrect an
+	// older snapshot over the last one.
+	got, err := s.LoadBans()
+	if err != nil {
+		t.Fatalf("LoadBans: %v", err)
+	}
+	assertBansEqual(t, got, want)
+}
+
+func TestSaveOffsetsSkipsUnchangedState(t *testing.T) {
+	t.Parallel()
+	s, _, _, rec := newTestStore(t, t.TempDir())
+	offsets := map[string]model.Checkpoint{
+		"/a.log": {Path: "/a.log", Dev: 1, Inode: 2, Offset: 10},
+	}
+
+	// The daemon saves on a timer whether or not anything moved.
+	for i := 0; i < 5; i++ {
+		if err := s.SaveOffsets(offsets); err != nil {
+			t.Fatalf("SaveOffsets #%d: %v", i, err)
+		}
+	}
+	if got := rec.countFor(OffsetsFile); got != 1 {
+		t.Errorf("writes = %d, want 1: an idle host must not re-fsync identical state", got)
+	}
+
+	tests := []struct {
+		name    string
+		offsets map[string]model.Checkpoint
+	}{
+		{"offset advanced", map[string]model.Checkpoint{"/a.log": {Path: "/a.log", Dev: 1, Inode: 2, Offset: 11}}},
+		{"file rotated", map[string]model.Checkpoint{"/a.log": {Path: "/a.log", Dev: 1, Inode: 3, Offset: 11}}},
+		{"source added", map[string]model.Checkpoint{
+			"/a.log": {Path: "/a.log", Dev: 1, Inode: 3, Offset: 11},
+			"/b.log": {Path: "/b.log", Dev: 1, Inode: 4, Offset: 0},
+		}},
+		{"source removed", map[string]model.Checkpoint{"/b.log": {Path: "/b.log", Dev: 1, Inode: 4, Offset: 0}}},
+	}
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := s.SaveOffsets(tc.offsets); err != nil {
+				t.Fatalf("SaveOffsets: %v", err)
+			}
+			if got, want := rec.countFor(OffsetsFile), i+2; got != want {
+				t.Errorf("writes = %d, want %d: a real change must be written", got, want)
+			}
+			if err := s.SaveOffsets(tc.offsets); err != nil {
+				t.Fatalf("SaveOffsets repeat: %v", err)
+			}
+			if got, want := rec.countFor(OffsetsFile), i+2; got != want {
+				t.Errorf("writes = %d, want %d: the repeat must be skipped", got, want)
+			}
+		})
+	}
+
+	// Skipping writes must not cost accuracy: the file still holds the
+	// latest state.
+	loaded, err := s.LoadOffsets()
+	if err != nil {
+		t.Fatalf("LoadOffsets: %v", err)
+	}
+	if len(loaded) != 1 || loaded["/b.log"].Inode != 4 {
+		t.Errorf("state = %+v, want only /b.log", loaded)
+	}
+}
+
+// TestValidationIsSymmetric pins that the save path refuses exactly what the
+// load path refuses. Otherwise a store hands out, within one run, the value a
+// restart silently throws away.
+func TestValidationIsSymmetric(t *testing.T) {
+	t.Parallel()
+
+	t.Run("bans", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		s, _, _, _ := newTestStore(t, dir)
+		at := time.Date(2024, 5, 1, 0, 0, 0, 0, time.UTC)
+		ok := model.Ban{IP: mustAddr(t, "9.9.9.9"), Monitor: "ok", At: at, Until: at.Add(time.Hour)}
+		if err := s.SaveBans([]model.Ban{
+			{IP: mustAddr(t, "1.1.1.1"), Monitor: "backwards", At: at, Until: at.Add(-time.Hour)},
+			{Monitor: "no-address", At: at, Until: at.Add(time.Hour)},
+			ok,
+		}); err != nil {
+			t.Fatalf("SaveBans: %v", err)
+		}
+		// Straight from memory...
+		got, err := s.LoadBans()
+		if err != nil {
+			t.Fatalf("LoadBans: %v", err)
+		}
+		assertBansEqual(t, got, []model.Ban{ok})
+		// ...and from the file a restart would read.
+		if err := s.Flush(); err != nil {
+			t.Fatalf("Flush: %v", err)
+		}
+		got, err = s.LoadBans()
+		if err != nil {
+			t.Fatalf("LoadBans after Flush: %v", err)
+		}
+		assertBansEqual(t, got, []model.Ban{ok})
+	})
+
+	t.Run("offsets", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		s, _, _, _ := newTestStore(t, dir)
+		if err := s.SaveOffsets(map[string]model.Checkpoint{
+			"/a.log": {Path: "/a.log", Offset: -5},
+			"/b.log": {Path: "/b.log", Offset: 17},
+		}); err != nil {
+			t.Fatalf("SaveOffsets: %v", err)
+		}
+		if cp, ok := s.Lookup("/a.log"); !ok || cp.Offset != 0 {
+			t.Errorf("Lookup(/a.log) = %+v, %v; want the offset clamped to 0 as on load", cp, ok)
+		}
+		if cp, ok := s.Lookup("/b.log"); !ok || cp.Offset != 17 {
+			t.Errorf("Lookup(/b.log) = %+v, %v; want it untouched", cp, ok)
+		}
+		data, err := os.ReadFile(filepath.Join(dir, OffsetsFile))
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		if strings.Contains(string(data), "-5") {
+			t.Errorf("a negative offset reached the file: %s", data)
+		}
+	})
+}
+
+func TestSaveOffsetsEmptyMapRoundTrips(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	s, _, _, _ := newTestStore(t, dir)
+
+	if err := s.SaveOffsets(nil); err != nil {
+		t.Fatalf("SaveOffsets(nil): %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, OffsetsFile))
+	if err != nil {
+		t.Fatalf("read offsets file: %v", err)
+	}
+	// SaveBans(nil) renders "bans": []; "offsets": null would be legal JSON
+	// but asymmetric, and these files are meant to be hand-inspectable.
+	if !strings.Contains(string(data), `"offsets": {}`) {
+		t.Errorf("empty state rendered as %s, want an empty object", data)
+	}
+	offsets, err := s.LoadOffsets()
+	if err != nil || len(offsets) != 0 {
+		t.Fatalf("LoadOffsets = %v, %v; want empty, nil", offsets, err)
+	}
+}
+
+// TestDeferredFailureIsLabelled pins that SaveBans' caller can tell "your save
+// failed" from "an older write never landed"; the state it just handed over is
+// safely in memory either way.
+func TestDeferredFailureIsLabelled(t *testing.T) {
+	t.Parallel()
+	s, _, sched, rec := newTestStore(t, t.TempDir())
+
+	rec.setFail(syscall.ENOSPC)
+	if err := s.SaveBans(sampleBans(t)); err != nil {
+		t.Fatalf("SaveBans: %v", err)
+	}
+	sched.fireAll() // the debounced write hits the full disk
+
+	rec.setFail(nil)
+	err := s.SaveBans(sampleBans(t)[:1])
+	if !errors.Is(err, syscall.ENOSPC) {
+		t.Fatalf("SaveBans = %v, want the deferred ENOSPC", err)
+	}
+	if !strings.Contains(err.Error(), "earlier") {
+		t.Errorf("error %q reads like a failure of this call, not of an earlier write", err)
+	}
+	// The current call did its job: the state it took is pending and lands on
+	// the next flush.
+	if err := s.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if got, err := s.LoadBans(); err != nil || len(got) != 1 {
+		t.Fatalf("LoadBans = %v, %v; want the state of the reporting call", got, err)
+	}
+}
+
+func TestSynchronousSaveReportsBothFailures(t *testing.T) {
+	t.Parallel()
+	s, _, _, rec := newTestStore(t, t.TempDir(), func(o *Options) { o.SynchronousBans = true })
+
+	rec.setFail(syscall.ENOSPC)
+	if err := s.SaveBans(sampleBans(t)); !errors.Is(err, syscall.ENOSPC) {
+		t.Fatalf("SaveBans = %v, want ENOSPC", err)
+	}
+	// Remember a deferred failure the way a failed Flush does.
+	if err := s.Flush(); !errors.Is(err, syscall.ENOSPC) {
+		t.Fatalf("Flush = %v, want ENOSPC", err)
+	}
+
+	rec.setFail(syscall.EROFS)
+	err := s.SaveBans(sampleBans(t)[:1])
+	if !errors.Is(err, syscall.EROFS) {
+		t.Errorf("error = %v, want the failure of this write", err)
+	}
+	if !errors.Is(err, syscall.ENOSPC) {
+		t.Errorf("error = %v, want the remembered earlier failure kept as well", err)
+	}
+
+	// Once a write lands, the older failure describes nothing at risk any
+	// more and must not be reported again.
+	rec.setFail(nil)
+	if err := s.SaveBans(sampleBans(t)[:1]); err != nil {
+		t.Errorf("SaveBans after recovery = %v, want nil", err)
 	}
 }
 

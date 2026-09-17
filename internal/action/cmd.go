@@ -11,14 +11,16 @@ import (
 	"banhammer/internal/model"
 )
 
-// maxMatchedLen caps the {matched} substitution. The value comes straight from
-// a log line, i.e. from the attacker; without a cap a single 64 KiB line could
-// push the child's argv past ARG_MAX and turn every ban into a failure.
+// maxMatchedLen caps the {matched} substitution. The value is the operator's
+// own rule pattern (rule.Result.Pattern), not log text, so it is trusted — but
+// a pathologically long pattern would still push the child's argv towards
+// ARG_MAX and turn every ban into a failure, and the cap costs nothing.
 const maxMatchedLen = 256
 
 // cmdBackend runs operator-supplied command templates.
 type cmdBackend struct {
 	base
+	chain string
 	shell bool
 	// Pre-tokenised templates: a syntax error in a template is caught at
 	// construction, not at 3 a.m. on the first ban.
@@ -26,7 +28,11 @@ type cmdBackend struct {
 }
 
 func newCmd(b base, spec Spec) (*cmdBackend, error) {
-	c := &cmdBackend{base: b, shell: spec.Shell}
+	chain := spec.Chain
+	if chain == "" {
+		chain = DefaultChain
+	}
+	c := &cmdBackend{base: b, chain: chain, shell: spec.Shell}
 	if strings.TrimSpace(spec.Ban) == "" || strings.TrimSpace(spec.Unban) == "" {
 		return nil, errors.New("action: cmd backend requires both ban and unban templates")
 	}
@@ -87,7 +93,7 @@ func (c *cmdBackend) runTemplate(ctx context.Context, name string, toks []string
 	if len(toks) == 0 {
 		return nil // optional template, nothing configured
 	}
-	argv := render(toks, varsFor(b))
+	argv := render(toks, varsFor(b, c.chain))
 	if _, err := c.exec(ctx, c.shell, argv...); err != nil {
 		return fmt.Errorf("cmd %s template: %w", name, err)
 	}
@@ -96,19 +102,20 @@ func (c *cmdBackend) runTemplate(ctx context.Context, name string, toks []string
 
 // vars holds the template substitutions for one operation.
 type vars struct {
-	ip, monitor, count, bantime, family, matched string
+	ip, monitor, count, bantime, family, matched, chain string
 }
 
-func varsFor(b model.Ban) vars {
+func varsFor(b model.Ban, chain string) vars {
 	v := vars{
 		monitor: b.Monitor,
 		count:   strconv.Itoa(b.Count),
 		bantime: banDuration(b).String(),
 		family:  b.Family().String(),
-		// Ban.Matched is attacker-controlled log text. It is empty for manual
-		// bans, which renders as an empty argument — the template's argv shape
-		// never changes.
+		// Ban.Matched is the rule pattern that fired, written by the operator
+		// in the config. It is empty for manual bans, which renders as an empty
+		// argument — the template's argv shape never changes.
 		matched: truncate(b.Matched, maxMatchedLen),
+		chain:   chain,
 	}
 	// {ip} is rendered from the parsed address, never from log text, so it can
 	// only ever be a valid IP literal.
@@ -132,6 +139,8 @@ func (v vars) lookup(name string) (string, bool) {
 		return v.family, true
 	case "matched":
 		return v.matched, true
+	case "chain":
+		return v.chain, true
 	}
 	return "", false
 }

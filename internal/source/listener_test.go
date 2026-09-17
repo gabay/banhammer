@@ -8,7 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"runtime"
+
 	"strings"
 	"testing"
 	"time"
@@ -288,6 +288,140 @@ func TestListenerTCPIdleTimeout(t *testing.T) {
 	}
 }
 
+// The idle timeout is reset by every byte, so a peer that keeps dribbling data
+// never goes idle and used to hold its slot for the life of the daemon. The
+// absolute lifetime is what actually bounds it.
+func TestListenerTCPConnectionLifetime(t *testing.T) {
+	t.Parallel()
+	l, _ := newTestListener(t, "tcp://127.0.0.1:0", false)
+	l.idle = time.Hour // the idle timeout must not be what ends this
+	l.maxLife = 100 * time.Millisecond
+	h := start(t, l)
+	addr := waitBound(t, l)
+
+	conn, err := net.Dial("tcp", addr.String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	// A slowloris: one line now, then a trickle that keeps resetting idle.
+	if _, err := io.WriteString(conn, "hello\n"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if got := h.lines(1); !equalStrings(got, []string{"hello"}) {
+		t.Fatalf("lines = %q", got)
+	}
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			case <-time.After(5 * time.Millisecond):
+			}
+			if _, err := io.WriteString(conn, "x"); err != nil {
+				return // the server hung up, which is the point
+			}
+		}
+	}()
+
+	if err := conn.SetReadDeadline(time.Now().Add(waitTimeout)); err != nil {
+		t.Fatalf("deadline: %v", err)
+	}
+	var buf [1]byte
+	_, err = conn.Read(buf[:])
+	close(stop)
+	<-done
+	if !errors.Is(err, io.EOF) {
+		t.Fatalf("read = %v, want EOF once the connection outlived maxLife", err)
+	}
+}
+
+// An oversized datagram must be truncated *and counted*, exactly as an
+// oversized stream line is. maxLine is lowered rather than sending 64 KiB,
+// because a datagram cannot exceed the 64 KiB read buffer anyway.
+func TestListenerUDPOversizedDatagram(t *testing.T) {
+	t.Parallel()
+	l, _ := newTestListener(t, "udp://127.0.0.1:0", false)
+	l.maxLine = 32
+	h := start(t, l)
+	addr := waitBound(t, l)
+
+	conn, err := net.Dial("udp", addr.String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	long := strings.Repeat("w", 200)
+	if _, err := conn.Write([]byte(long + "\nfits\n" + long + "\n")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	got := h.lines(3)
+	if len(got[0]) != l.maxLine {
+		t.Errorf("first line = %d bytes, want %d (truncate, never drop)", len(got[0]), l.maxLine)
+	}
+	if got[1] != "fits" {
+		t.Errorf("second line = %q, want fits", got[1])
+	}
+	waitFor(t, "the truncations to be counted", func() bool {
+		return l.Stats().TruncatedLines == 2
+	})
+}
+
+// The stream path must report truncations even when the connection ends
+// without EOF, which is where the count used to be dropped.
+func TestListenerTCPCountsTruncatedLinesWithoutEOF(t *testing.T) {
+	t.Parallel()
+	l, _ := newTestListener(t, "tcp://127.0.0.1:0", false)
+	l.maxLine = 16
+	h := start(t, l)
+	addr := waitBound(t, l)
+
+	conn, err := net.Dial("tcp", addr.String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	if _, err := io.WriteString(conn, strings.Repeat("v", 100)+"\n"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if got := h.lines(1); len(got[0]) != l.maxLine {
+		t.Fatalf("line = %d bytes, want %d", len(got[0]), l.maxLine)
+	}
+	// Note: the connection is still open — no EOF, no idle timeout, no
+	// cancellation. The count must already be visible.
+	waitFor(t, "the truncation to be counted", func() bool {
+		return l.Stats().TruncatedLines == 1
+	})
+}
+
+// A clean shutdown must not leave the socket file behind, or the next start
+// has to treat it as stale.
+func TestListenerUnixUnlinksSocketOnShutdown(t *testing.T) {
+	t.Parallel()
+	sock := filepath.Join(t.TempDir(), "shutdown.sock")
+	l, _ := newTestListener(t, "unix://"+sock, false)
+	ctx, cancel := context.WithCancel(context.Background())
+	errc := make(chan error, 1)
+	go func() { errc <- l.Run(ctx, make(chan model.Event, 4)) }()
+	waitBound(t, l)
+
+	if _, err := os.Stat(sock); err != nil {
+		t.Fatalf("socket missing while listening: %v", err)
+	}
+	cancel()
+	if err := <-errc; err != nil {
+		t.Fatalf("Run = %v", err)
+	}
+	if _, err := os.Stat(sock); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("stat after shutdown = %v, want the socket to have been unlinked", err)
+	}
+}
+
 func TestListenerUDP(t *testing.T) {
 	t.Parallel()
 	l, _ := newTestListener(t, "udp://127.0.0.1:0", false)
@@ -449,7 +583,7 @@ func TestListenerCancelPromptlyWithoutLeaking(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			before := runtime.NumGoroutine()
+			before := sourceGoroutines()
 
 			l, _ := newTestListener(t, tc.addr(t), false)
 			l.idle = time.Hour // a live connection must not be waited on

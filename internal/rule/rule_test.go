@@ -1,6 +1,7 @@
 package rule
 
 import (
+	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -21,6 +22,12 @@ func TestCompileErrors(t *testing.T) {
 		name    string
 		spec    Spec
 		wantErr string
+		// wantIs is the cause the error must wrap, where the package has a
+		// sentinel for it. The ip-group cases lean on it rather than on the
+		// message: whether Go's own regexp accepts a duplicate capture group
+		// name is not this package's contract, but rejecting the pattern with
+		// its own explanation is.
+		wantIs error
 	}{
 		{
 			name:    "unknown format",
@@ -38,19 +45,29 @@ func TestCompileErrors(t *testing.T) {
 			wantErr: "ip_field requires format: json",
 		},
 		{
-			name:    "two ip macros in one pattern",
-			spec:    Spec{Line: []string{"<IP> -> <IP>"}},
-			wantErr: "capture groups",
+			name:   "two ip macros in one pattern",
+			spec:   Spec{Line: []string{"<IP> -> <IP>"}},
+			wantIs: errTooManyIPGroups,
 		},
 		{
-			name:    "macro plus explicit group",
-			spec:    Spec{Line: []string{`<IP> (?P<ip>\d+)`}},
-			wantErr: "capture groups",
+			name:   "macro plus explicit group",
+			spec:   Spec{Line: []string{`<IP> (?P<ip>\d+)`}},
+			wantIs: errTooManyIPGroups,
 		},
 		{
-			name:    "two explicit groups",
-			spec:    Spec{Line: []string{`(?P<ip>a)|(?P<ip>b)`}},
-			wantErr: "capture groups",
+			name:   "two explicit groups",
+			spec:   Spec{Line: []string{`(?P<ip>a)|(?P<ip>b)`}},
+			wantIs: errTooManyIPGroups,
+		},
+		{
+			name:   "two explicit groups, new spelling",
+			spec:   Spec{Line: []string{`(?<ip>a)|(?<ip>b)`}},
+			wantIs: errTooManyIPGroups,
+		},
+		{
+			name:   "two ip groups in a field pattern",
+			spec:   Spec{Format: "json", Fields: map[string]string{"msg": "<IP> to <IP>"}},
+			wantIs: errTooManyIPGroups,
 		},
 		{
 			name:    "macro inside a character class",
@@ -94,10 +111,18 @@ func TestCompileErrors(t *testing.T) {
 			t.Parallel()
 			_, err := Compile(tc.spec)
 			if err == nil {
-				t.Fatalf("Compile() = nil error, want %q", tc.wantErr)
+				t.Fatalf("Compile() = nil error, want %q%v", tc.wantErr, tc.wantIs)
 			}
-			if !strings.Contains(err.Error(), tc.wantErr) {
+			if tc.wantIs != nil && !errors.Is(err, tc.wantIs) {
+				t.Errorf("error %q does not wrap %v", err, tc.wantIs)
+			}
+			if tc.wantErr != "" && !strings.Contains(err.Error(), tc.wantErr) {
 				t.Errorf("error %q does not contain %q", err, tc.wantErr)
+			}
+			// However it is phrased, the message has to name the pattern the
+			// operator has to go and fix.
+			if !strings.Contains(err.Error(), "rule:") && !strings.Contains(err.Error(), "ignore:") {
+				t.Errorf("error %q is not attributed to the rule package", err)
 			}
 		})
 	}
@@ -411,10 +436,31 @@ func TestMatchJSONLinePattern(t *testing.T) {
 	if res.IP.String() != "203.0.113.30" {
 		t.Errorf("ip = %v", res.IP)
 	}
-	// With no decoded paths needed, a malformed line is simply a non-match
-	// rather than a decode error; document that by asserting it.
-	if _, out := set.Match([]byte(`{"status":403`)); out != OutcomeNoMatch {
+	// The monitor needs no decoded field, but it still declared a JSON log:
+	// a truncated line is a decode error the operator has to be able to see
+	// in decode_errors, not an invisible no_match.
+	if _, out := set.Match([]byte(`{"status":403`)); out != OutcomeDecodeError {
+		t.Errorf("outcome = %v, want decode_error", out)
+	}
+	// And that verdict wins even when the regex would have hit: half a line
+	// is not evidence to ban on.
+	if _, out := set.Match([]byte(`{"status":403,"remote_ip":"203.0.113.30"`)); out != OutcomeDecodeError {
+		t.Errorf("outcome = %v, want decode_error", out)
+	}
+	// Well-formed JSON that nothing matches is still just a non-match.
+	if _, out := set.Match([]byte(`{"status":200,"remote_ip":"203.0.113.30"}`)); out != OutcomeNoMatch {
 		t.Errorf("outcome = %v, want no_match", out)
+	}
+}
+
+// A text monitor must not pay for, or be second-guessed by, JSON validation:
+// most logs are not JSON at all.
+func TestMatchTextIgnoresJSONValidity(t *testing.T) {
+	t.Parallel()
+	set := mustCompile(t, Spec{Line: []string{"from <IP>"}})
+	res, out := set.Match([]byte(`{"msg":"from 1.2.3.4`))
+	if out != OutcomeMatch || res.IP.String() != "1.2.3.4" {
+		t.Errorf("got (%v,%v), want match 1.2.3.4", res.IP, out)
 	}
 }
 
@@ -531,6 +577,13 @@ func TestMatchNoMatchIsAllocationFree(t *testing.T) {
 	if got := testing.AllocsPerRun(200, func() { jsonSet.Match(jline) }); got != 0 {
 		t.Errorf("non-matching json line allocated %v times, want 0", got)
 	}
+
+	// A json monitor that names no field at all still walks the line to
+	// validate it; that walk must be as free as the one above.
+	lineOnly := mustCompile(t, Spec{Format: "json", Line: []string{`"status":40[13].*"remote_ip":"<IP>"`}})
+	if got := testing.AllocsPerRun(200, func() { lineOnly.Match(jline) }); got != 0 {
+		t.Errorf("non-matching line-only json line allocated %v times, want 0", got)
+	}
 }
 
 var (
@@ -637,4 +690,47 @@ func BenchmarkMatchParallel(b *testing.B) {
 			set.Match(benchMissLine)
 		}
 	})
+}
+
+// A json monitor with only whole-line patterns decodes nothing but still
+// validates the line, which is the one path this costs anything on.
+var benchJSONLineOnlySpec = Spec{
+	Format: "json",
+	Line:   []string{`"status":40[13].*"remote_ip":"<IP>"`},
+}
+
+func BenchmarkMatchJSONLineOnlyMiss(b *testing.B) {
+	set, err := Compile(benchJSONLineOnlySpec)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.SetBytes(int64(len(benchJSONMiss)))
+	for b.Loop() {
+		if _, out := set.Match(benchJSONMiss); out != OutcomeNoMatch {
+			b.Fatalf("outcome = %v", out)
+		}
+	}
+}
+
+var (
+	// A netfilter line matched by a pattern with nothing to pin the address:
+	// the IPv6 alternative takes the MAC's hex groups, boundaryOK rejects
+	// them, and reaching SRC= is what the rescan is for.
+	benchRejectSpec = Spec{Line: []string{"<IP>"}}
+	benchRejectLine = []byte("Sep 15 12:00:00 host kernel: [12345.678] IN=eth0 OUT= MAC=00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:08:00 SRC=203.0.113.9 DST=10.0.0.1 LEN=60 PROTO=TCP SPT=54321 DPT=22")
+)
+
+func BenchmarkMatchAfterBoundaryRejection(b *testing.B) {
+	set, err := Compile(benchRejectSpec)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.SetBytes(int64(len(benchRejectLine)))
+	for b.Loop() {
+		if _, out := set.Match(benchRejectLine); out != OutcomeMatch {
+			b.Fatalf("outcome = %v", out)
+		}
+	}
 }

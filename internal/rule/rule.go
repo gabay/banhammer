@@ -27,7 +27,10 @@
 //
 // Those refusals report OutcomeNoIP rather than a wrong ban. RE2 has no
 // lookaround, so they are enforced by inspecting the bytes around the capture
-// after the match; see boundaryOK.
+// after the match; see boundaryOK. A refusal is a verdict on that capture and
+// not on the line, so extraction goes on to the next match: the address in
+// "MAC=00:11:...:ff SRC=203.0.113.9" comes after a token the engine offered
+// first and boundaryOK threw away.
 //
 // A macro inside a character class is a compile error rather than a silently
 // wrong regex: Go reads [<IP>] as the class of '<', 'I', 'P' and '>', so
@@ -37,6 +40,7 @@ package rule
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"net/netip"
 	"regexp"
@@ -73,6 +77,8 @@ const (
 	// OutcomeIgnored means a match fired but an ignore rule vetoed it.
 	OutcomeIgnored
 	// OutcomeDecodeError means the line is not the JSON the monitor expects.
+	// Every line of a format: json monitor is parsed, including by monitors
+	// whose rules read no field, so this counts all of them (§4.2).
 	OutcomeDecodeError
 	// OutcomeNoIP means a match fired but no usable address came out of it,
 	// e.g. <HOST> matched a DNS name, or the field held a zone-scoped address.
@@ -257,36 +263,38 @@ func compileFieldPatterns(m map[string]string, usePrefilter bool) ([]pattern, er
 	return out, nil
 }
 
+// errTooManyIPGroups is the sentinel behind "this pattern has more than one ip
+// capture group". It is wrapped, never returned bare, so the message can name
+// the offending pattern while tests can still match on the cause rather than
+// on its wording.
+var errTooManyIPGroups = errors.New("expected at most one")
+
 func compilePattern(field, src string, usePrefilter bool) (pattern, error) {
 	where := "pattern"
 	if field != "" {
 		where = "field " + field
 	}
-	expanded, macros, err := expandMacros(src)
+	exp, err := expandMacros(src)
 	if err != nil {
 		return pattern{}, fmt.Errorf("rule: %s %q: %w", where, src, err)
 	}
-	re, err := regexp.Compile(expanded)
+	// Counted from the pattern text rather than from the compiled regexp's
+	// SubexpNames, and before regexp.Compile, so that this explanation is what
+	// the user sees: Go currently accepts duplicate capture-group names, but if
+	// it ever stops, its parse error would arrive first and say far less.
+	if exp.ipGroups > 1 {
+		return pattern{}, fmt.Errorf("rule: %s %q: %d %q capture groups, %w", where, src, exp.ipGroups, ipGroup, errTooManyIPGroups)
+	}
+	re, err := regexp.Compile(exp.pattern)
 	if err != nil {
 		return pattern{}, fmt.Errorf("rule: %s %q: %w", where, src, err)
 	}
 
-	n := 0
-	for _, name := range re.SubexpNames() {
-		if name == ipGroup {
-			n++
-		}
-	}
-	if n > 1 {
-		return pattern{}, fmt.Errorf("rule: %s %q: %d %q capture groups, expected at most one", where, src, n, ipGroup)
-	}
-
-	p := pattern{src: src, field: field, re: re, ipIdx: -1, macro: macros > 0}
-	if n == 1 {
-		p.ipIdx = re.SubexpIndex(ipGroup)
-	}
+	// SubexpIndex reports -1 when the group is absent, which is exactly the
+	// "no address from this pattern" marker Match wants.
+	p := pattern{src: src, field: field, re: re, ipIdx: re.SubexpIndex(ipGroup), macro: exp.macros > 0}
 	if usePrefilter {
-		p.lit = requiredLiteral(expanded, re)
+		p.lit = requiredLiteral(exp.pattern, re)
 		if p.lit != "" {
 			p.litB = []byte(p.lit)
 		}
@@ -345,8 +353,17 @@ type state struct {
 }
 
 // NeedsIPField reports whether the match patterns cannot produce an address by
-// themselves, so the monitor must name an IPField. Config uses this to reject
-// a monitor that could never identify an offender.
+// themselves, so the monitor must name an IPField.
+//
+// Nothing in the daemon calls this today: config answers the same question
+// before it ever reaches Compile, with a text check over the pattern source
+// (hasIPGroup), because it has to report every problem in a file rather than
+// stop at the first one that fails to compile. This is the answer from the
+// compiled rules rather than from their text, which is what makes it worth
+// keeping: it is the oracle the package's own tests check the macro and
+// group-detection logic against, and the hook a caller holding a *Set can use
+// without re-deriving it. The two can drift, so if the config check ever grows
+// a case, it belongs here too.
 func (s *Set) NeedsIPField() bool { return !s.patternHasIP }
 
 // Match applies the rules to one raw line.
@@ -355,6 +372,11 @@ func (s *Set) NeedsIPField() bool { return !s.patternHasIP }
 // retained. Ignore rules are evaluated after a match fires and take precedence
 // over IP extraction, so a line the operator asked to ignore never shows up as
 // a warning about a missing address.
+//
+// In JSON mode every line is parsed, even by a monitor whose rules are all
+// whole-line regexes and which therefore needs no field value: malformed input
+// is the operator's problem to see, so it reports OutcomeDecodeError rather
+// than melting into the no_match count.
 func (s *Set) Match(raw []byte) (Result, Outcome) {
 	if len(s.contains) > 0 && !bytes.Contains(raw, s.contains) {
 		return Result{}, OutcomeNoMatch
@@ -384,13 +406,16 @@ func (s *Set) matchText(raw []byte) (Result, Outcome) {
 }
 
 func (s *Set) matchJSON(raw []byte) (Result, Outcome) {
-	var st *state
-	if len(s.paths) > 0 {
-		st = s.pool.Get().(*state)
-		if err := decode.Fields(raw, s.paths, st.fields); err != nil {
-			s.pool.Put(st)
-			return Result{}, OutcomeDecodeError
-		}
+	// The line is decoded even when no rule names a field. A monitor that
+	// declared format: json and then wrote only whole-line regexes still has
+	// a JSON log, and skipping the parse would file its malformed lines under
+	// no_match — leaving decode_errors (§4.9) under-counting exactly the lines
+	// an operator needs to see. The walk is the same one the field case pays
+	// for, and it allocates nothing.
+	st := s.pool.Get().(*state)
+	defer s.pool.Put(st)
+	if err := decode.Fields(raw, s.paths, st.fields); err != nil {
+		return Result{}, OutcomeDecodeError
 	}
 
 	var (
@@ -421,27 +446,19 @@ func (s *Set) matchJSON(raw []byte) (Result, Outcome) {
 		}
 	}
 	if !hit {
-		if st != nil {
-			s.pool.Put(st)
-		}
 		return Result{}, OutcomeNoMatch
 	}
 
 	ignored := s.ignoredText(raw)
-	if !ignored && len(s.ignoreFields) > 0 && st != nil {
+	if !ignored && len(s.ignoreFields) > 0 {
 		_, ignored, _ = s.matchFieldSet(st.fields, s.ignoreFields)
 	}
-
-	// The IPField value is read before the scratch map goes back to the pool.
-	if !ignored && s.ipField != "" && st != nil {
+	if !ignored && s.ipField != "" {
 		if v, ok := st.fields[s.ipField]; ok {
 			ip, haveP = parseIP(v)
 		} else {
 			haveP = false
 		}
-	}
-	if st != nil {
-		s.pool.Put(st)
 	}
 
 	switch {
@@ -492,7 +509,7 @@ func (s *Set) ignoredText(raw []byte) bool {
 // group, the address it extracted. The two booleans are (matched, gotIP):
 // a match with an unparseable address is still a match.
 func (p *pattern) matchBytes(raw []byte) (netip.Addr, bool, bool) {
-	if p.litB != nil && !bytes.Contains(raw, p.litB) {
+	if p.lit != "" && !bytes.Contains(raw, p.litB) {
 		return netip.Addr{}, false, false
 	}
 	if p.ipIdx < 0 {
@@ -503,16 +520,23 @@ func (p *pattern) matchBytes(raw []byte) (netip.Addr, bool, bool) {
 	if loc == nil {
 		return netip.Addr{}, false, false
 	}
-	s, e := loc[2*p.ipIdx], loc[2*p.ipIdx+1]
-	if s < 0 {
-		return netip.Addr{}, true, false
+	ip, ok, rejected := addrAt(p, raw, loc)
+	if !rejected {
+		return ip, true, ok
 	}
-	text := raw[s:e]
-	if p.macro && !boundaryOK(raw, s, e, bytes.IndexByte(text, ':') >= 0) {
-		return netip.Addr{}, true, false
+	// The whole subject goes back to the engine rather than the tail of it,
+	// so ^ and \A still mean what the user wrote; the price is that the
+	// rejected match is examined twice, since the stdlib has no way to resume
+	// a search at an offset without re-slicing. This roughly doubles the cost
+	// of a line that has already matched and whose first capture was bogus
+	// (BenchmarkMatchAfterBoundaryRejection), and costs nothing at all on the
+	// non-matching path that every line takes.
+	for _, loc := range p.re.FindAllSubmatchIndex(raw, -1) {
+		if ip, ok, rejected := addrAt(p, raw, loc); !rejected {
+			return ip, true, ok
+		}
 	}
-	ip, ok := parseIP(string(text))
-	return ip, true, ok
+	return netip.Addr{}, true, false
 }
 
 // matchString is matchBytes for an already-decoded JSON field value.
@@ -527,14 +551,60 @@ func (p *pattern) matchString(v string) (netip.Addr, bool, bool) {
 	if loc == nil {
 		return netip.Addr{}, false, false
 	}
+	ip, ok, rejected := addrAt(p, v, loc)
+	if !rejected {
+		return ip, true, ok
+	}
+	// Same rescan as matchBytes, for the same reason: a field value can
+	// carry a near miss ahead of the address just as a raw line can.
+	for _, loc := range p.re.FindAllStringSubmatchIndex(v, -1) {
+		if ip, ok, rejected := addrAt(p, v, loc); !rejected {
+			return ip, true, ok
+		}
+	}
+	return netip.Addr{}, true, false
+}
+
+// addrAt reads the ip group out of one match of sub.
+//
+// rejected separates the two ways a capture can fail to produce an address.
+// A boundary rejection means the capture was never an address at all — the
+// leading hex of a MAC, the first four octets of a five-octet token — and the
+// engine offered it only because RE2 has no lookaround and so cannot know what
+// boundaryOK knows. The caller answers that by looking for a later match:
+// "the leftmost match is unusable" is not "this line holds no address", and
+// treating it as such lets an attacker suppress their own ban by arranging for
+// a near-miss token to appear earlier in the line.
+//
+// A capture that is cleanly delimited but does not parse is the opposite: a
+// deliberate refusal (a <HOST> that matched a DNS name, an unspecified
+// address), so the search stops there rather than wandering on to some other
+// address on the line — which, in "connection from host.example.com to
+// 10.0.0.1", would be the server.
+func addrAt[T string | []byte](p *pattern, sub T, loc []int) (addr netip.Addr, ok, rejected bool) {
 	s, e := loc[2*p.ipIdx], loc[2*p.ipIdx+1]
 	if s < 0 {
-		return netip.Addr{}, true, false
+		// An optional group that did not take part in this match.
+		return netip.Addr{}, false, false
 	}
-	text := v[s:e]
-	if p.macro && !boundaryOK(v, s, e, strings.IndexByte(text, ':') >= 0) {
-		return netip.Addr{}, true, false
+	// The capture is turned into a string only once it is worth parsing:
+	// netip keeps a reference to the text it is given, so the conversion
+	// allocates, and a rescan can walk past many rejected captures.
+	if p.macro && !boundaryOK(sub, s, e, hasColon(sub[s:e])) {
+		return netip.Addr{}, false, true
 	}
-	ip, ok := parseIP(text)
-	return ip, true, ok
+	addr, ok = parseIP(string(sub[s:e]))
+	return addr, ok, false
+}
+
+// hasColon reports whether the capture looks like IPv6, which is all
+// boundaryOK needs to know to pick the right delimiters. A capture is at most
+// a few dozen bytes, so a plain scan beats converting it to call IndexByte.
+func hasColon[T string | []byte](sub T) bool {
+	for i := 0; i < len(sub); i++ {
+		if sub[i] == ':' {
+			return true
+		}
+	}
+	return false
 }

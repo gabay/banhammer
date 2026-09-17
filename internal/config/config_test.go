@@ -148,7 +148,7 @@ func TestDefaultsAreBuiltIn(t *testing.T) {
 		MaxTracked:    100000,
 		StartAt:       "checkpoint",
 		OnRepeat:      "ignore",
-		Action:        ActionSpec{Name: "iptables", Timeout: 10 * time.Second},
+		Action:        ActionSpec{Name: "iptables", Chain: "INPUT", Timeout: 10 * time.Second},
 	}
 	if m.Settings != want {
 		t.Errorf("settings = %+v\nwant %+v", m.Settings, want)
@@ -177,6 +177,7 @@ defaults:
   on_repeat: extend
   action:
     name: nft
+    chain: FORWARD
     timeout: 30s
 monitors:
   inherits:
@@ -189,6 +190,12 @@ monitors:
     window: 90s
     start_at: beginning
     action: dryrun
+  docker:
+    file: /c
+    match: "<IP>"
+    action:
+      name: iptables
+      chain: DOCKER-USER
 `
 	c := mustParse(t, src)
 
@@ -196,7 +203,7 @@ monitors:
 	if in != c.Defaults {
 		t.Errorf("inherits = %+v\nwant defaults %+v", in, c.Defaults)
 	}
-	if in.Action.Name != "nft" || in.Action.Timeout != 30*time.Second {
+	if in.Action.Name != "nft" || in.Action.Chain != "FORWARD" || in.Action.Timeout != 30*time.Second {
 		t.Errorf("inherited action = %+v", in.Action)
 	}
 
@@ -208,9 +215,14 @@ monitors:
 		t.Errorf("non-overridden settings did not inherit: %+v", ov)
 	}
 	// A monitor's action replaces the defaults action outright; the 30s timeout
-	// from defaults must not leak into it.
-	if ov.Action.Name != "dryrun" || ov.Action.Timeout != 10*time.Second {
-		t.Errorf("overridden action = %+v, want dryrun with the built-in timeout", ov.Action)
+	// from defaults must not leak into it, though chain inherits when unset.
+	if ov.Action.Name != "dryrun" || ov.Action.Chain != "FORWARD" || ov.Action.Timeout != 10*time.Second {
+		t.Errorf("overridden action = %+v, want dryrun with inherited chain and built-in timeout", ov.Action)
+	}
+
+	dk := c.Monitors["docker"].Settings
+	if dk.Action.Name != "iptables" || dk.Action.Chain != "DOCKER-USER" {
+		t.Errorf("docker action = %+v, want iptables on DOCKER-USER", dk.Action)
 	}
 }
 

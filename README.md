@@ -15,7 +15,7 @@ monitors:
 ```
 > 5 hits in 10 minutes ⇒ `DROP` for 1 hour. That's the whole config.
 
-**Status: v1 implementation complete.** Production-ready, fully tested with zero-allocation fast paths, sliding-window rate tracking, robust persistent state, and systemd sandboxing. See [PROJECT.md](./PROJECT.md) for full architectural specifications.
+**Status: v1 implementation complete.** Production-ready, fully tested with zero-allocation fast paths, sliding-window rate tracking, robust persistent state, and systemd sandboxing. See [PROJECT.md](./PROJECT.md) for product requirements and [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) for package boundaries and invariants.
 
 ---
 
@@ -34,7 +34,7 @@ monitors:
 
 ### 1. Build from Source
 
-Banhammer requires Go 1.22+ and has zero C/C++ runtime dependencies.
+Banhammer requires Go 1.26+ and has zero C/C++ runtime dependencies.
 
 ```bash
 # Clone and build
@@ -123,13 +123,33 @@ monitors:
     strip_syslog: true
     match: "authentication failure.*rhost=<IP>"
     action: ipset
+
+  docker-nginx:
+    file: /var/log/nginx/docker-access.log
+    match: '^<IP> .* "(GET|POST) [^"]*" 40[13] '
+    action:
+      name: iptables        # or ipset
+      chain: DOCKER-USER    # attach jump/match rule to DOCKER-USER instead of INPUT
 ```
+
+### Firewall Chain Attachment (`INPUT`, `DOCKER-USER`, `FORWARD`, etc.)
+
+By default, Banhammer attaches its rules to the `INPUT` chain (`input` hook for `nft`). For services running inside Docker containers, Docker routes traffic through the `FORWARD` chain and evaluates the `DOCKER-USER` chain before its own rules. To block traffic destined for Docker containers, set `chain: DOCKER-USER` (with `iptables` or `ipset`) or `chain: forward` (with `nft`), either globally under `defaults.action` or per monitor under `monitors.<name>.action`:
+
+```yaml
+defaults:
+  action:
+    name: iptables
+    chain: DOCKER-USER
+```
+
+For custom command actions (`cmd`), `{chain}` is available as a template variable alongside `{ip}`, `{monitor}`, `{bantime}`, `{count}`, `{family}`, and `{matched}`.
 
 ---
 
 ## CLI Command Guide
 
-All CLI management commands communicate with the running daemon over its Unix domain control socket (`/run/banhammer.sock` when root, or `<state_dir>/control.sock`).
+All CLI management commands communicate with the running daemon over its Unix domain control socket (`/run/banhammer/control.sock` when running as root, or `<state_dir>/control.sock`). You can override the socket path on any command with `-s, --socket`.
 
 ### `run` — Start Daemon
 Starts the intrusion prevention daemon, ingestion sources, matching workers, aggregator, and action executor.
@@ -138,6 +158,7 @@ Starts the intrusion prevention daemon, ingestion sources, matching workers, agg
 banhammer run -c /etc/banhammer/config.yaml [flags]
 ```
 * `-c, --config`: Path to configuration file (default: `/etc/banhammer/config.yaml` or `./config.yaml`).
+* `-s, --socket`: Control socket path override.
 * `--dry-run`: Evaluate logs and report bans without executing firewall changes.
 * `--state-dir`: Override persistent state directory.
 * `--log-format`: Log output format (`text` or `json`).
@@ -151,13 +172,14 @@ banhammer check -c /etc/banhammer/config.yaml
 ```
 
 ### `test` — Rule & Timeline Simulator
-The regex authoring tool: simulates log parsing line-by-line against sample files, displaying per-line verdicts (`MATCH`, `NO_MATCH`, `IGNORED`, `NO_IP`), extracted IPs, and timestamps of triggered bans.
+The regex authoring tool: simulates log parsing line-by-line against sample files, displaying per-line verdicts (`MATCH`, `NO_MATCH`, `IGNORED`, `NO_IP`), extracted IPs, allowlist filtering, and simulated timestamps for triggered bans and unbans (expiries).
 
 ```bash
-banhammer test -c /etc/banhammer/config.yaml -m sshd -f /var/log/auth.log
+banhammer test -c /etc/banhammer/config.yaml -m sshd -f /var/log/auth.log --rate 5s
 ```
 * `-m, --monitor`: Name of the monitor to test.
-* `-f, --file`: Path to sample log file.
+* `-f, --file`: Path to sample log file (or `-` for stdin).
+* `--rate`: Simulated time step advanced per log line (default `1s`).
 
 ### `status` — Live Daemon Telemetry
 Queries the active daemon for uptime, pipeline metrics (lines read, dropped, matched), monitor status, tracked IPs, and the list of active bans.
@@ -168,7 +190,7 @@ banhammer status --json
 ```
 
 ### `ban` — Manually Ban an IP
-Manually adds an IP address to the firewall ban list for a designated period.
+Manually adds an IP address to the firewall ban list for a designated period (or the monitor's configured `bantime` if `--time` is omitted).
 
 ```bash
 banhammer ban 198.51.100.25
@@ -188,6 +210,42 @@ Instructs the running daemon to re-read its configuration file and recompile rul
 
 ```bash
 banhammer reload
+```
+
+---
+
+## Observability & Prometheus Metrics
+
+When `metrics.listen` is configured (e.g. `127.0.0.1:9090`), Banhammer exposes an HTTP server with two endpoints:
+
+* `GET /metrics`: Prometheus text exposition format (0.0.4).
+* `GET /healthz`: Liveness probe (`200 OK`).
+
+### Exported Metrics
+
+All counters and gauges use the `banhammer_` namespace prefix:
+
+| Metric Name | Type | Labels | Description |
+|---|---|---|---|
+| `banhammer_lines_read_total` | Counter | `monitor` | Total number of log lines read from sources. |
+| `banhammer_lines_dropped_total` | Counter | `monitor` | Total number of log lines dropped due to queue saturation or buffer limits. |
+| `banhammer_matches_total` | Counter | `monitor` | Total number of log lines matching monitor attack patterns. |
+| `banhammer_bans_total` | Counter | `monitor` | Total number of bans issued. |
+| `banhammer_unbans_total` | Counter | `monitor` | Total number of bans lifted, by expiry or by hand. |
+| `banhammer_action_errors_total` | Counter | `backend` | Total number of firewall action execution failures. |
+| `banhammer_decode_errors_total` | Counter | `monitor` | Total number of log decoding or JSON parsing failures. |
+| `banhammer_tracked_ips` | Gauge | `monitor` | Current number of unique offending IP addresses tracked in memory. |
+| `banhammer_active_bans` | Gauge | `monitor` | Current number of active firewall IP bans in effect. |
+| `banhammer_uptime_seconds` | Gauge | — | Total daemon uptime in seconds. |
+
+### Prometheus Scrape Configuration
+
+```yaml
+scrape_configs:
+  - job_name: "banhammer"
+    scrape_interval: 15s
+    static_configs:
+      - targets: ["127.0.0.1:9090"]
 ```
 
 ---
@@ -215,9 +273,10 @@ Banhammer replaces Fail2ban's multi-file configuration maze (`jail.conf`, `jail.
 | `<HOST>` / `<IP>` | `<IP>` or `<HOST>` | Macro expanding to robust IPv4 and IPv6 capture regex. |
 | JSON log filtering | `format: json` + `match: {field: regex}` | Native JSON decoding with dotted field paths (AND semantics). No python regex hacks. |
 | `banaction = iptables-multiport` | `action: iptables` | Built-in `iptables` backend handles chains and IPv4/IPv6 automatically. |
-| `banaction = nftables-multiport` | `action: nft` | Native `nftables` tables and sets with kernel timeouts. |
+| `chain = INPUT` / `DOCKER-USER` | `action: { chain: DOCKER-USER }` | Configurable chain attachment (`INPUT` by default, `DOCKER-USER` for Docker, `FORWARD`, etc.). |
+| `banaction = nftables-multiport` | `action: nft` | Native `nftables` tables and sets (`chain: input`, `forward`, etc.). |
 | `banaction = ipset` | `action: ipset` | High-performance hash sets with O(1) matching; handles 100k+ bans. |
-| Custom action scripts | `action: cmd` | Command templates with `{ip}`, `{monitor}`, `{bantime}`, `{count}`. |
+| Custom action scripts | `action: cmd` | Command templates with `{ip}`, `{monitor}`, `{bantime}`, `{count}`, `{chain}`. |
 
 ### Migration Example: SSH Jail
 

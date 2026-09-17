@@ -153,7 +153,7 @@ func TestOffendOnAllowlistedIPIsSilentNoop(t *testing.T) {
 	m.SetPolicy("sshd", Policy{Bantime: time.Hour})
 
 	for _, ip := range []string{"127.0.0.1", "::ffff:127.0.0.1", "::1", "203.0.113.9"} {
-		m.Offend("sshd", addr(t, ip), 10)
+		m.Offend("sshd", addr(t, ip), 10, "")
 	}
 	if n := len(fe.banned()); n != 0 {
 		t.Errorf("enforcer saw %d bans, want 0", n)

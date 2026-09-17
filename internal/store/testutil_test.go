@@ -1,11 +1,18 @@
 package store
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"log/slog"
+	"net/netip"
 	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
+
+	"banhammer/internal/model"
 )
 
 // fakeClock is a manually driven clock so debounce logic is tested without
@@ -148,17 +155,78 @@ func discardLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError + 1}))
 }
 
+// logCapture records what the store logged. Several of the store's contracts
+// are about log *volume* — one line per corrupt file, not per bad entry; one
+// warning per checkpoint clash, not one every five seconds — and those can
+// only be asserted by looking at the records.
+type logCapture struct {
+	mu      sync.Mutex
+	records []slog.Record
+}
+
+func (c *logCapture) Enabled(context.Context, slog.Level) bool { return true }
+
+func (c *logCapture) Handle(_ context.Context, r slog.Record) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.records = append(c.records, r.Clone())
+	return nil
+}
+
+func (c *logCapture) WithAttrs([]slog.Attr) slog.Handler { return c }
+func (c *logCapture) WithGroup(string) slog.Handler      { return c }
+
+func (c *logCapture) logger() *slog.Logger { return slog.New(c) }
+
+// withMessage returns every record whose message is exactly msg.
+func (c *logCapture) withMessage(msg string) []slog.Record {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []slog.Record
+	for _, r := range c.records {
+		if r.Message == msg {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+func (c *logCapture) reset() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.records = nil
+}
+
+// attr returns the value logged under key, or nil.
+func attr(r slog.Record, key string) any {
+	var found any
+	r.Attrs(func(a slog.Attr) bool {
+		if a.Key == key {
+			found = a.Value.Any()
+			return false
+		}
+		return true
+	})
+	return found
+}
+
 // newTestStore opens a store on dir with a fake clock and scheduler, and
-// returns it along with the write recorder.
-func newTestStore(t *testing.T, dir string) (*Store, *fakeClock, *fakeScheduler, *writeRecorder) {
+// returns it along with the write recorder. Tests that need different
+// behaviour (a longer interval, a real timer, a capturing logger) pass an
+// override instead of hand-rolling their own OpenWith.
+func newTestStore(t *testing.T, dir string, override ...func(*Options)) (*Store, *fakeClock, *fakeScheduler, *writeRecorder) {
 	t.Helper()
 	clk := newFakeClock()
 	sched := &fakeScheduler{}
-	s, err := OpenWith(dir, Options{
+	o := Options{
 		Log:       discardLogger(),
 		Now:       clk.Now,
 		AfterFunc: sched.AfterFunc,
-	})
+	}
+	for _, f := range override {
+		f(&o)
+	}
+	s, err := OpenWith(dir, o)
 	if err != nil {
 		t.Fatalf("OpenWith(%q): %v", dir, err)
 	}
@@ -174,4 +242,64 @@ func newTestStore(t *testing.T, dir string) (*Store, *fakeClock, *fakeScheduler,
 	})
 
 	return s, clk, sched, rec
+}
+
+func mustAddr(t *testing.T, s string) netip.Addr {
+	t.Helper()
+	a, err := netip.ParseAddr(s)
+	if err != nil {
+		t.Fatalf("ParseAddr(%q): %v", s, err)
+	}
+	return a
+}
+
+func sampleBans(t *testing.T) []model.Ban {
+	t.Helper()
+	at := time.Date(2024, 2, 29, 23, 59, 58, 123456789, time.FixedZone("IST", 2*3600))
+	return []model.Ban{
+		{IP: mustAddr(t, "1.2.3.4"), Monitor: "sshd", At: at, Until: at.Add(time.Hour), Count: 5, Offense: 1},
+		{IP: mustAddr(t, "2001:db8::dead:beef"), Monitor: "nginx", At: at.UTC(), Until: at.UTC().Add(48 * time.Hour), Count: 12, Offense: 3},
+		{IP: mustAddr(t, "::ffff:10.0.0.9"), Monitor: "postfix", At: at, Until: at.Add(time.Minute), Count: 1, Offense: 1},
+	}
+}
+
+func assertBansEqual(t *testing.T, got, want []model.Ban) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("got %d bans, want %d (%v)", len(got), len(want), got)
+	}
+	for i := range want {
+		g, w := got[i], want[i]
+		if g.IP != w.IP || g.Monitor != w.Monitor || g.Count != w.Count || g.Offense != w.Offense {
+			t.Errorf("ban %d = %+v, want %+v", i, g, w)
+		}
+		assertTimeEqual(t, fmt.Sprintf("ban %d At", i), g.At, w.At)
+		assertTimeEqual(t, fmt.Sprintf("ban %d Until", i), g.Until, w.Until)
+	}
+}
+
+func assertTimeEqual(t *testing.T, what string, got, want time.Time) {
+	t.Helper()
+	if !got.Equal(want) {
+		t.Errorf("%s = %v, want %v", what, got, want)
+	}
+	if got.Format(time.RFC3339Nano) != want.Format(time.RFC3339Nano) {
+		t.Errorf("%s zone offset lost: %s vs %s", what,
+			got.Format(time.RFC3339Nano), want.Format(time.RFC3339Nano))
+	}
+}
+
+// assertQuarantined checks the evidence was preserved, not deleted.
+func assertQuarantined(t *testing.T, dir, base, want string) {
+	t.Helper()
+	if _, err := os.Stat(filepath.Join(dir, base)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("%s still present after quarantine (err=%v)", base, err)
+	}
+	got, err := os.ReadFile(filepath.Join(dir, base+CorruptSuffix))
+	if err != nil {
+		t.Fatalf("corrupt file not preserved: %v", err)
+	}
+	if string(got) != want {
+		t.Errorf("quarantined content = %q, want the original %q", got, want)
+	}
 }

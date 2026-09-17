@@ -46,14 +46,14 @@ func TestRequiredLiteral(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			expanded, _, err := expandMacros(tc.pattern)
+			exp, err := expandMacros(tc.pattern)
 			if err != nil {
 				t.Fatalf("expandMacros: %v", err)
 			}
-			re, cerr := regexp.Compile(expanded)
+			re, cerr := regexp.Compile(exp.pattern)
 			got := ""
 			if cerr == nil {
-				got = requiredLiteral(expanded, re)
+				got = requiredLiteral(exp.pattern, re)
 			}
 			if got != tc.want {
 				t.Errorf("requiredLiteral(%q) = %q, want %q", tc.pattern, got, tc.want)
@@ -88,15 +88,15 @@ func TestPrefilterIsDerivedForRealPatterns(t *testing.T) {
 func TestDerivedLiteralAppearsInEveryMatch(t *testing.T) {
 	t.Parallel()
 	for _, src := range differentialPatterns {
-		expanded, _, err := expandMacros(src)
+		exp, err := expandMacros(src)
 		if err != nil {
 			continue
 		}
-		re, err := regexp.Compile(expanded)
+		re, err := regexp.Compile(exp.pattern)
 		if err != nil {
 			continue
 		}
-		lit := requiredLiteral(expanded, re)
+		lit := requiredLiteral(exp.pattern, re)
 		if lit == "" {
 			continue
 		}
@@ -310,35 +310,144 @@ func FuzzMatch(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, raw []byte) {
 		for _, set := range []*Set{textSet, jsonSet} {
-			res, out := set.Match(raw)
-			switch out {
-			case OutcomeMatch:
-				if !res.IP.IsValid() {
-					t.Fatalf("match without an address: %q", raw)
-				}
-				if res.IP.Is4In6() {
-					t.Fatalf("v4-in-v6 address escaped Unmap: %v", res.IP)
-				}
-				if res.IP.Zone() != "" {
-					t.Fatalf("zone-scoped address accepted: %v", res.IP)
-				}
-				if res.IP.IsUnspecified() {
-					t.Fatalf("unspecified address accepted: %v", res.IP)
-				}
-				if res.Pattern == "" {
-					t.Fatalf("match without a pattern: %q", raw)
-				}
-			case OutcomeNoMatch, OutcomeDecodeError:
-				if res.IP.IsValid() || res.Pattern != "" {
-					t.Fatalf("non-match carried a result %+v for %q", res, raw)
-				}
-			case OutcomeIgnored, OutcomeNoIP:
-				if res.IP.IsValid() {
-					t.Fatalf("outcome %v carried an address %v", out, res.IP)
-				}
-			default:
-				t.Fatalf("unknown outcome %v", out)
+			checkMatchInvariants(t, set, raw)
+		}
+	})
+}
+
+// checkMatchInvariants asserts the contract Match owes every caller,
+// whatever the input: the outcome and the result agree, and an address that
+// comes back is one the ban manager can actually key on.
+func checkMatchInvariants(t *testing.T, set *Set, raw []byte) (Result, Outcome) {
+	t.Helper()
+	res, out := set.Match(raw)
+	switch out {
+	case OutcomeMatch:
+		if !res.IP.IsValid() {
+			t.Fatalf("match without an address: %q", raw)
+		}
+		if res.IP.Is4In6() {
+			t.Fatalf("v4-in-v6 address escaped Unmap: %v", res.IP)
+		}
+		if res.IP.Zone() != "" {
+			t.Fatalf("zone-scoped address accepted: %v", res.IP)
+		}
+		if res.IP.IsUnspecified() {
+			t.Fatalf("unspecified address accepted: %v", res.IP)
+		}
+		if res.Pattern == "" {
+			t.Fatalf("match without a pattern: %q", raw)
+		}
+	case OutcomeNoMatch, OutcomeDecodeError:
+		if res.IP.IsValid() || res.Pattern != "" {
+			t.Fatalf("non-match carried a result %+v for %q", res, raw)
+		}
+	case OutcomeIgnored, OutcomeNoIP:
+		if res.IP.IsValid() {
+			t.Fatalf("outcome %v carried an address %v", out, res.IP)
+		}
+	default:
+		t.Fatalf("unknown outcome %v", out)
+	}
+	return res, out
+}
+
+// FuzzExtractIP is the target PROJECT.md §7 names: extraction specifically,
+// rather than matching in general. It leans on the shared invariants and adds
+// the two that belong to extraction — the address must survive a round trip
+// through its own canonical text, and it must not depend on how many times
+// the line is looked at.
+func FuzzExtractIP(f *testing.F) {
+	for _, line := range differentialCorpus {
+		f.Add([]byte(line))
+	}
+	// Lines built to make extraction work for its money: a near miss ahead of
+	// a real address, a MAC ahead of a source, an address at each edge.
+	for _, line := range []string{
+		"MAC=00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:08:00 SRC=203.0.113.9 DST=10.0.0.1",
+		"from 1.2.3.4.5 then from 9.9.9.9",
+		"999.1.1.1 198.51.100.7",
+		"fe80::1%eth0 2001:db8::5",
+		"::ffff:1.2.3.4",
+		"1.2.3.4",
+		"[2001:db8::1]:443",
+	} {
+		f.Add([]byte(line))
+	}
+
+	sets := make([]*Set, 0, 3)
+	for _, spec := range []Spec{
+		{Line: []string{"<IP>"}},
+		{Line: []string{"<HOST>"}},
+		{Line: []string{"from <IP> port", `^<IP> `}},
+	} {
+		set, err := Compile(spec)
+		if err != nil {
+			f.Fatal(err)
+		}
+		sets = append(sets, set)
+	}
+
+	f.Fuzz(func(t *testing.T, raw []byte) {
+		for _, set := range sets {
+			res, out := checkMatchInvariants(t, set, raw)
+			if out != OutcomeMatch {
+				continue
 			}
+			// Extraction is a pure function of the line: the rescan on a
+			// rejected capture must not leave anything behind.
+			if again, _ := set.Match(raw); again != res {
+				t.Fatalf("second Match of %q gave %+v, first gave %+v", raw, again, res)
+			}
+			// Whatever text the address came from, what comes out is the
+			// canonical key the rest of the daemon counts on.
+			round, ok := parseIP(res.IP.String())
+			if !ok || round != res.IP {
+				t.Fatalf("address %v does not survive its own text (%v, %v)", res.IP, round, ok)
+			}
+		}
+	})
+}
+
+// FuzzRequiredLiteral fuzzes the pattern, not the line.
+//
+// FuzzPrefilter pins 22 patterns and lets the fuzzer invent log lines, which
+// finds bad lines but never a bad pattern. The invariant the prefilter rests
+// on is universally quantified over patterns — "the derived literal appears in
+// every string this pattern matches" — so it is only really tested by letting
+// the fuzzer write the pattern too. An unsound case added to literalOf would
+// show up here and nowhere else.
+func FuzzRequiredLiteral(f *testing.F) {
+	for _, src := range differentialPatterns {
+		f.Add(src, "Failed password for root from 203.0.113.42 port 22")
+	}
+	for _, line := range differentialCorpus {
+		f.Add("from <IP>", line)
+	}
+	f.Add(`(a|ab)c`, "abc")
+	f.Add(`(?i)ABC`, "abc")
+	f.Add(`x{2,}y`, "xxy")
+
+	f.Fuzz(func(t *testing.T, src, line string) {
+		// Compile time is not the thing under test; a pattern big enough to
+		// be slow to parse teaches nothing.
+		if len(src) > 256 {
+			t.Skip()
+		}
+		exp, err := expandMacros(src)
+		if err != nil {
+			return
+		}
+		re, err := regexp.Compile(exp.pattern)
+		if err != nil {
+			return
+		}
+		lit := requiredLiteral(exp.pattern, re)
+		if lit == "" {
+			return
+		}
+		if re.MatchString(line) && !strings.Contains(line, lit) {
+			t.Fatalf("pattern %q derived required literal %q, but it matched %q, which does not contain it", src, lit, line)
 		}
 	})
 }

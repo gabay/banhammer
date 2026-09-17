@@ -5,6 +5,7 @@ package store
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 
@@ -16,6 +17,12 @@ import (
 // not to the file's existence, and unlinking it would race a competing Open.
 const lockFileName = ".lock"
 
+// lockFilePerm matches the state files' 0644 — the lock holds no secrets and
+// an operator should be able to see who owns the directory — but it is spelled
+// out separately: borrowing stateFilePerm made it look as if the lock were one
+// of the state files, and the two are free to diverge.
+const lockFilePerm fs.FileMode = 0o644
+
 // acquireLock takes an exclusive, non-blocking flock on dir/.lock.
 //
 // flock is used rather than a PID file because the kernel drops the lock when
@@ -26,7 +33,7 @@ func acquireLock(dir string) (*os.File, error) {
 	// O_NOFOLLOW: if someone plants a symlink here, the flock would otherwise
 	// be taken on a completely unrelated file and two daemons could both
 	// "own" this directory.
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|unix.O_NOFOLLOW, stateFilePerm)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|unix.O_NOFOLLOW, lockFilePerm)
 	if err != nil {
 		if errors.Is(err, unix.ELOOP) {
 			return nil, fmt.Errorf("lock file %s is a symlink; refusing to follow it", path)

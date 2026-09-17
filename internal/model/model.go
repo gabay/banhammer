@@ -44,10 +44,13 @@ type Ban struct {
 	Count   int        `json:"count"`   // hits that triggered this ban
 	Offense int        `json:"offense"` // 1 for a first offense, n for the nth
 
-	// Matched carries the log text (or pattern) that triggered the ban, for the
-	// {matched} action template variable. It is attacker-controlled data: it
-	// must never reach a shell, and consumers should treat it as untrusted and
-	// bound its length. Empty when unknown, e.g. for a manual ban.
+	// Matched names the rule that triggered the ban — the operator-written
+	// pattern from the monitor's config, not the log line itself — and feeds
+	// the {matched} action template variable.
+	//
+	// Raw log text is deliberately NOT stored here: it is attacker-controlled,
+	// it would be persisted verbatim to bans.json, and it would be pasted into
+	// a command line. Empty when there is no rule, e.g. for a manual ban.
 	Matched string `json:"matched,omitempty"`
 }
 

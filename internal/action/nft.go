@@ -35,9 +35,16 @@ var nftNotFound = []string{"no such file or directory", "does not exist"}
 // silently release an extended ban early.
 type nft struct {
 	base
+	hook string
 }
 
-func newNFT(b base) *nft { return &nft{base: b} }
+func newNFT(b base, chain string) *nft {
+	hook := strings.ToLower(strings.TrimSpace(chain))
+	if hook == "" {
+		hook = nftChain
+	}
+	return &nft{base: b, hook: hook}
+}
 
 func (*nft) Name() string { return "nft" }
 
@@ -52,8 +59,8 @@ func (n *nft) Start(ctx context.Context) error {
 		{"nft", "add", "table", nftFamily, nftTable},
 		{"nft", "add", "set", nftFamily, nftTable, setV4, "{ type ipv4_addr; }"},
 		{"nft", "add", "set", nftFamily, nftTable, setV6, "{ type ipv6_addr; }"},
-		{"nft", "add", "chain", nftFamily, nftTable, nftChain,
-			"{ type filter hook input priority -10; policy accept; }"},
+		{"nft", "add", "chain", nftFamily, nftTable, n.hook,
+			fmt.Sprintf("{ type filter hook %s priority -10; policy accept; }", n.hook)},
 	}
 	for _, argv := range steps {
 		if _, err := n.exec(ctx, false, argv...); err != nil {
@@ -64,9 +71,9 @@ func (n *nft) Start(ctx context.Context) error {
 		}
 	}
 
-	listed, err := n.exec(ctx, false, "nft", "list", "chain", nftFamily, nftTable, nftChain)
+	listed, err := n.exec(ctx, false, "nft", "list", "chain", nftFamily, nftTable, n.hook)
 	if err != nil {
-		return fmt.Errorf("listing nft chain %s: %w", nftChain, err)
+		return fmt.Errorf("listing nft chain %s: %w", n.hook, err)
 	}
 	existing := string(listed)
 	for _, r := range []struct{ proto, set string }{{"ip", setV4}, {"ip6", setV6}} {
@@ -79,11 +86,11 @@ func (n *nft) Start(ctx context.Context) error {
 		if strings.Contains(existing, strings.Join(body, " ")) {
 			continue
 		}
-		argv := append([]string{"nft", "add", "rule", nftFamily, nftTable, nftChain}, body...)
+		argv := append([]string{"nft", "add", "rule", nftFamily, nftTable, n.hook}, body...)
 		if _, err := n.exec(ctx, false, argv...); err != nil {
 			return fmt.Errorf("adding nft rule (%s): %w", Quote(argv), err)
 		}
-		n.log.Info("installed nft rule", "set", r.set)
+		n.log.Info("installed nft rule", "hook", n.hook, "set", r.set)
 	}
 	return nil
 }

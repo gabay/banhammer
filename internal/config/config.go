@@ -36,10 +36,19 @@ const (
 	defaultStartAt       = "checkpoint"
 	defaultOnRepeat      = "ignore"
 	defaultAction        = "iptables"
+	defaultActionChain   = "INPUT"
 	defaultActionTimeout = 10 * time.Second
 	// commandAction is the backend name implied by inline command templates.
 	commandAction = "cmd"
 )
+
+// maxQueueSize is the largest queue_size accepted.
+//
+// The queue is one channel allocated up front, so an over-enthusiastic value
+// is not a slow degradation but an immediate out-of-memory at startup — after
+// `banhammer check` has already said the file is fine. §6 promises memory is
+// bounded by config; that only holds if the config itself is bounded.
+const maxQueueSize = 1 << 20
 
 // Config is the fully resolved configuration: every field is populated, and
 // every monitor's Settings have already been merged with Defaults.
@@ -48,10 +57,17 @@ type Config struct {
 	LogFormat  string // text|json, default text
 	AllowLocal bool   // default true
 	Allowlist  []netip.Prefix
-	Metrics    struct{ Listen string }
+	Metrics    Metrics
 	QueueSize  int                 // default 8192
 	Defaults   Settings            // the effective defaults, after built-ins
 	Monitors   map[string]*Monitor // key = monitor name
+}
+
+// Metrics is the optional Prometheus endpoint. It is a named type, not an
+// anonymous struct, so that a caller building a Config in code (tests and
+// benchmarks do) can name the thing it is assigning.
+type Metrics struct {
+	Listen string // host:port; empty disables the endpoint
 }
 
 // Settings are the knobs that may appear under `defaults:` or on a monitor.
@@ -86,6 +102,7 @@ type Monitor struct {
 // ActionSpec selects and parameterises the firewall backend.
 type ActionSpec struct {
 	Name    string // iptables|ipset|nft|dryrun|cmd; default iptables
+	Chain   string // firewall chain or netfilter hook; default INPUT
 	Start   string // cmd templates; presence of Ban implies Name=="cmd"
 	Ban     string
 	Unban   string
@@ -129,10 +146,11 @@ func (e *LoadError) Unwrap() []error { return e.Errs }
 //
 // On failure the returned error is a *LoadError listing every problem found.
 //
-// A block whose YAML failed to decode is validated no further: its values are
-// missing, so anything else said about it would be invented. The rest of the
-// file is still validated, so one typo costs one round-trip, not one per
-// mistake.
+// A block whose YAML lost a value — a wrong shape, a duration that did not
+// parse — is validated no further: the value is missing, so anything else said
+// about it would be invented. An unknown key costs nothing, so its block is
+// still validated. Either way the rest of the file is validated, so one
+// mistake costs one round-trip, not one per mistake.
 func Load(path string) (*Config, error) {
 	src, err := os.ReadFile(path)
 	if err != nil {
@@ -144,15 +162,15 @@ func Load(path string) (*Config, error) {
 // parse is Load without the filesystem, so tests (and any future non-file
 // source) can exercise the whole pipeline on a byte slice.
 func parse(src []byte, path string) (*Config, error) {
-	raw, parseErrs := decode(src)
+	raw, parseProblems := decode(src)
 	if raw == nil {
 		// The parser lost its place; nothing downstream can be trusted.
-		return nil, &LoadError{Path: path, Errs: parseErrs}
+		return nil, &LoadError{Path: path, Errs: problemErrors(parseProblems)}
 	}
 
 	cfg := resolve(raw)
 	problems := validate(cfg, raw)
-	if len(parseErrs) == 0 {
+	if len(parseProblems) == 0 {
 		if len(problems) == 0 {
 			return cfg, nil
 		}
@@ -163,13 +181,9 @@ func parse(src []byte, path string) (*Config, error) {
 		return nil, &LoadError{Path: path, Errs: errs}
 	}
 
-	owners := newLineOwners(src)
-	undecoded := make(map[origin]bool, len(parseErrs))
-	for _, err := range parseErrs {
-		undecoded[owners.owner(errorLine(err))] = true
-	}
-	errs := make([]error, 0, len(parseErrs)+len(problems))
-	errs = append(errs, parseErrs...)
+	errs := make([]error, 0, len(parseProblems)+len(problems))
+	errs = append(errs, problemErrors(parseProblems)...)
+	undecoded := lostBlocks(src, parseProblems)
 	for _, p := range problems {
 		if undecoded[p.origin] {
 			continue
@@ -179,22 +193,55 @@ func parse(src []byte, path string) (*Config, error) {
 	return nil, &LoadError{Path: path, Errs: errs}
 }
 
-// errorLinePrefix matches the "line 12: " every decode problem carries.
+// problemErrors is the decode problems as plain errors, for the report.
+func problemErrors(ps []parseProblem) []error {
+	errs := make([]error, 0, len(ps))
+	for _, p := range ps {
+		errs = append(errs, p.err)
+	}
+	return errs
+}
+
+// lostBlocks is the set of blocks whose values did not survive decoding, and
+// which must therefore not be validated.
+func lostBlocks(src []byte, ps []parseProblem) map[origin]bool {
+	lost := make(map[origin]bool, len(ps))
+	owners := newLineOwners(src)
+	for _, p := range ps {
+		if !p.valuesLost {
+			continue
+		}
+		line, ok := errorLine(p.err)
+		if !ok {
+			// The problem is about the file rather than about a block (a
+			// stray second document is the only one). It has no line to
+			// attribute, and line 0 would resolve to the global scope and
+			// silence every global check.
+			continue
+		}
+		lost[owners.owner(line)] = true
+	}
+	return lost
+}
+
+// errorLinePrefix matches the "line 12: " a decode problem about a particular
+// place in the file carries.
 var errorLinePrefix = regexp.MustCompile(`^line (\d+): `)
 
-// errorLine extracts the source line a decode problem refers to, or 0 for the
-// whole-file problems (a stray second document, say), which are attributed to
-// the top level.
-func errorLine(err error) int {
+// errorLine extracts the source line a decode problem refers to. It reports
+// false for a problem about the whole file, which belongs to no block: there
+// is no such thing as line 0, and pretending otherwise attributes the problem
+// to the top level.
+func errorLine(err error) (int, bool) {
 	m := errorLinePrefix.FindStringSubmatch(err.Error())
 	if m == nil {
-		return 0
+		return 0, false
 	}
 	n, convErr := strconv.Atoi(m[1])
 	if convErr != nil {
-		return 0
+		return 0, false
 	}
-	return n
+	return n, true
 }
 
 // builtinDefaults is the configuration of a file that sets nothing at all.
@@ -209,7 +256,11 @@ func builtinDefaults() Settings {
 		MaxTracked:    defaultMaxTracked,
 		StartAt:       defaultStartAt,
 		OnRepeat:      defaultOnRepeat,
-		Action:        ActionSpec{Name: defaultAction, Timeout: defaultActionTimeout},
+		Action: ActionSpec{
+			Name:    defaultAction,
+			Chain:   defaultActionChain,
+			Timeout: defaultActionTimeout,
+		},
 	}
 }
 
@@ -281,11 +332,11 @@ func applySettings(dst *Settings, r *rawSettings) {
 	setIf(&dst.StartAt, r.StartAt)
 	setIf(&dst.OnRepeat, r.OnRepeat)
 	if r.Action != nil {
-		// An action is replaced wholesale rather than merged field by field.
-		// Merging would combine `defaults: {action: iptables}` with a monitor's
-		// command templates into a contradiction; "the monitor owns its action"
-		// is the rule a reader can hold in their head.
-		dst.Action = r.Action.resolve()
+		// Named backend parameters (name, chain, timeout) are inherited from
+		// dst.Action unless overridden; command templates are never inherited
+		// across actions so a monitor switching backends doesn't inherit stale
+		// shell commands.
+		dst.Action = r.Action.resolve(dst.Action)
 	}
 }
 
@@ -308,11 +359,34 @@ func setNum[S ~int | ~float64, D int | float64](dst *D, src *S) {
 	}
 }
 
-// resolve fills in an action's own defaults. Command templates imply the "cmd"
-// backend, so `action: {ban: ..., unban: ...}` needs no name.
-func (a *rawAction) resolve() ActionSpec {
-	spec := ActionSpec{Name: defaultAction, Timeout: defaultActionTimeout}
+// resolve fills in an action's effective settings using base as defaults.
+// When neither a backend name nor command templates are given (e.g.
+// `action: {chain: DOCKER-USER}`), the monitor inherits the base backend
+// (including any command templates and timeout); when a backend name or
+// templates are specified, chain is inherited from base while timeout resets
+// to defaultActionTimeout unless explicitly set.
+func (a *rawAction) resolve(base ActionSpec) ActionSpec {
+	spec := ActionSpec{
+		Name:    defaultAction,
+		Chain:   defaultActionChain,
+		Timeout: defaultActionTimeout,
+	}
+	if a.Name == nil && !a.hasTemplates() {
+		spec = base
+		if spec.Name == "" {
+			spec.Name = defaultAction
+		}
+		if spec.Chain == "" {
+			spec.Chain = defaultActionChain
+		}
+		if spec.Timeout <= 0 {
+			spec.Timeout = defaultActionTimeout
+		}
+	} else if base.Chain != "" {
+		spec.Chain = base.Chain
+	}
 	setIf(&spec.Name, a.Name)
+	setIf(&spec.Chain, a.Chain)
 	setIf(&spec.Start, a.Start)
 	setIf(&spec.Ban, a.Ban)
 	setIf(&spec.Unban, a.Unban)

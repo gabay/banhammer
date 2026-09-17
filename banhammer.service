@@ -6,12 +6,29 @@ Wants=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/banhammer run -c /etc/banhammer/config.yaml
-ExecReload=/usr/bin/banhammer reload
+
+# Refuse to start on a broken config rather than crash-looping under
+# Restart=on-failure with the reason buried in the journal.
+ExecStartPre=/usr/bin/banhammer check -c /etc/banhammer/config.yaml
+ExecStart=/usr/bin/banhammer run -c /etc/banhammer/config.yaml --socket /run/banhammer/control.sock
+# `systemctl reload` re-reads the config over the control socket. SIGHUP does
+# the same thing; this way a wedged daemon reports an error instead of
+# silently swallowing the signal.
+ExecReload=/usr/bin/banhammer reload --socket /run/banhammer/control.sock
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=15s
 KillMode=mixed
+
+# Identity. Without User=/Group= the unit runs as root, where
+# AmbientCapabilities is a no-op and the capability set below buys nothing.
+# Create the account before enabling the unit:
+#   useradd --system --no-create-home --shell /usr/sbin/nologin banhammer
+User=banhammer
+Group=banhammer
+# Log files are typically root:adm 0640, and an unprivileged daemon cannot
+# read them otherwise. Drop this if every monitored path is world-readable.
+SupplementaryGroups=adm
 
 # Sandboxing & Hardening
 NoNewPrivileges=yes
@@ -19,16 +36,36 @@ ProtectSystem=strict
 ProtectHome=read-only
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
+ProtectKernelLogs=yes
 ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+PrivateTmp=yes
+PrivateDevices=yes
 MemoryDenyWriteExecute=yes
+LockPersonality=yes
+RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+UMask=0077
 
-# Sandboxed Directories
+# Sandboxed Directories. ProtectSystem=strict makes everything outside these
+# read-only, which is why the control socket lives in /run/banhammer/ rather
+# than at /run/banhammer.sock — /run itself is not writable here.
 StateDirectory=banhammer
+StateDirectoryMode=0750
 RuntimeDirectory=banhammer
+RuntimeDirectoryMode=0750
 ConfigurationDirectory=banhammer
+# iptables takes /run/xtables.lock; leading '-' so hosts using only nft do not
+# fail to start over a file they never create.
+ReadWritePaths=-/run/xtables.lock
 
 # Capabilities for firewall control (iptables, nftables, ipset)
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW

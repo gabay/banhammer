@@ -1,6 +1,8 @@
 package rule
 
 import (
+	"encoding/json"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -174,25 +176,104 @@ func TestIPMacroNearMisses(t *testing.T) {
 }
 
 // A near-miss in the middle of an otherwise realistic line must not become a
-// ban of a truncated address.
+// ban of a truncated address — and, just as important, must not swallow the
+// real address that follows it. boundaryOK is a filter the RE2 engine knows
+// nothing about, so "the leftmost match was rejected" says nothing about the
+// rest of the line; an attacker who can get a near-miss token logged before
+// their own address would otherwise suppress their own ban.
 func TestIPMacroNearMissInContext(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		name, pattern, line string
+		want                string // "" when no address may be extracted
 	}{
-		{"five octets in sshd line", "from <IP> port", "Failed password from 1.2.3.4.5 port 22"},
-		{"oversized octet", "from <IP> port", "Failed password from 999.1.1.1 port 22"},
-		{"zone scoped", "from <IP> port", "Failed password from fe80::1%eth0 port 22"},
+		{"five octets in sshd line", "from <IP>", "Failed password from 1.2.3.4.5 port 22", ""},
+		{"oversized octet", "from <IP> port", "Failed password from 999.1.1.1 port 22", ""},
+		{"zone scoped", "from <IP> port", "Failed password from fe80::1%eth0 port 22", ""},
+
+		// The iptables/kernel shape: the IPv6 alternative matches the MAC
+		// prefix, boundaryOK rejects it, and SRC= is the actual offender.
+		{
+			"mac address before the real source",
+			"<IP>",
+			"IN=eth0 OUT= MAC=00:11:22:33:44:55:66:77:88:99:aa:bb:cc:dd:ee:ff:08:00 SRC=203.0.113.9 DST=10.0.0.1 PROTO=TCP",
+			"203.0.113.9",
+		},
+		{
+			"five octets then a real address",
+			"from <IP>",
+			"denied from 1.2.3.4.5 then from 9.9.9.9",
+			"9.9.9.9",
+		},
+		{
+			"oversized octet then a real address",
+			"<IP>",
+			"999.1.1.1 retried as 198.51.100.7",
+			"198.51.100.7",
+		},
+		{
+			"zone scoped then a real address",
+			"<IP>",
+			"fe80::1%eth0 relayed 2001:db8::5",
+			"2001:db8::5",
+		},
+		{
+			"long digit run then a real address",
+			"<IP>",
+			"id=12345.1.1.1 addr=192.0.2.8",
+			"192.0.2.8",
+		},
+		// Nothing acceptable follows the near miss: still no address.
+		{"near miss twice", "<IP>", "1.2.3.4.5 and 999.1.1.1", ""},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			got, out := matchOne(t, tc.pattern, tc.line)
-			if out == OutcomeMatch {
-				t.Fatalf("extracted %q from %q, want no address", got, tc.line)
+			if tc.want == "" {
+				if out == OutcomeMatch {
+					t.Fatalf("extracted %q from %q, want no address", got, tc.line)
+				}
+				return
+			}
+			if out != OutcomeMatch {
+				t.Fatalf("outcome = %v, want match (ip=%q)", out, got)
+			}
+			if got != tc.want {
+				t.Errorf("ip = %q, want %q", got, tc.want)
 			}
 		})
 	}
+
+	// The same subject reached through a decoded JSON field, which is the
+	// string half of the matcher and had the identical bug.
+	t.Run("string path", func(t *testing.T) {
+		t.Parallel()
+		for _, tc := range tests {
+			set, err := Compile(Spec{Format: "json", Fields: map[string]string{"msg": tc.pattern}})
+			if err != nil {
+				t.Fatalf("Compile(%q): %v", tc.pattern, err)
+			}
+			line, err := json.Marshal(map[string]string{"msg": tc.line})
+			if err != nil {
+				t.Fatal(err)
+			}
+			res, out := set.Match(line)
+			if tc.want == "" {
+				if out == OutcomeMatch {
+					t.Errorf("%s: extracted %v from %q, want no address", tc.name, res.IP, tc.line)
+				}
+				continue
+			}
+			if out != OutcomeMatch {
+				t.Errorf("%s: outcome = %v, want match", tc.name, out)
+				continue
+			}
+			if res.IP.String() != tc.want {
+				t.Errorf("%s: ip = %v, want %v", tc.name, res.IP, tc.want)
+			}
+		}
+	})
 }
 
 func TestHostMacro(t *testing.T) {
@@ -229,23 +310,38 @@ func TestExpandMacros(t *testing.T) {
 		name    string
 		in      string
 		count   int
+		groups  int
 		wantErr string
 		// wantSub is text the expansion must contain.
 		wantSub string
 	}{
-		{name: "no macro", in: `Failed password`, count: 0, wantSub: "Failed password"},
-		{name: "ip macro", in: `from <IP>`, count: 1, wantSub: `(?P<ip>`},
-		{name: "host macro", in: `from <HOST>`, count: 1, wantSub: `(?P<ip>`},
-		{name: "two macros", in: `<IP> -> <IP>`, count: 2},
-		{name: "angle brackets that are not a macro", in: `a<b>c`, count: 0, wantSub: `a<b>c`},
-		{name: "lowercase is not a macro", in: `<ip>`, count: 0, wantSub: `<ip>`},
-		{name: "prefix only", in: `<I`, count: 0, wantSub: `<I`},
-		{name: "escaped angle is left alone", in: `\x3cIP>`, count: 0, wantSub: `\x3cIP>`},
-		{name: "macro after an escaped bracket", in: `\[<IP>\]`, count: 1, wantSub: `(?P<ip>`},
-		{name: "macro after a closed class", in: `[abc]<IP>`, count: 1, wantSub: `(?P<ip>`},
-		{name: "macro after a negated class", in: `[^]]<IP>`, count: 1, wantSub: `(?P<ip>`},
-		{name: "macro after a posix class", in: `[[:digit:]]<IP>`, count: 1, wantSub: `(?P<ip>`},
-		{name: "macro after a class containing a bracket", in: `[]a]<IP>`, count: 1, wantSub: `(?P<ip>`},
+		{name: "no macro", in: `Failed password`, wantSub: "Failed password"},
+		{name: "ip macro", in: `from <IP>`, count: 1, groups: 1, wantSub: `(?P<ip>`},
+		{name: "host macro", in: `from <HOST>`, count: 1, groups: 1, wantSub: `(?P<ip>`},
+		{name: "two macros", in: `<IP> -> <IP>`, count: 2, groups: 2},
+		{name: "angle brackets that are not a macro", in: `a<b>c`, wantSub: `a<b>c`},
+		{name: "lowercase is not a macro", in: `<ip>`, wantSub: `<ip>`},
+		{name: "prefix only", in: `<I`, wantSub: `<I`},
+		{name: "escaped angle is left alone", in: `\x3cIP>`, wantSub: `\x3cIP>`},
+		{name: "macro after an escaped bracket", in: `\[<IP>\]`, count: 1, groups: 1, wantSub: `(?P<ip>`},
+		{name: "macro after a closed class", in: `[abc]<IP>`, count: 1, groups: 1, wantSub: `(?P<ip>`},
+		{name: "macro after a negated class", in: `[^]]<IP>`, count: 1, groups: 1, wantSub: `(?P<ip>`},
+		{name: "macro after a posix class", in: `[[:digit:]]<IP>`, count: 1, groups: 1, wantSub: `(?P<ip>`},
+		{name: "macro after a class containing a bracket", in: `[]a]<IP>`, count: 1, groups: 1, wantSub: `(?P<ip>`},
+
+		// A group name is a token, not pattern text. Expanding the <IP> in
+		// (?P<IP>...) used to produce (?P(?P<ip>...)...) and an error about
+		// Perl syntax that named nothing the user had written.
+		{name: "user group named IP", in: `(?P<IP>[0-9.]+)`, wantSub: `(?P<IP>[0-9.]+)`},
+		{name: "user group named HOST", in: `(?P<HOST>\S+)`, wantSub: `(?P<HOST>\S+)`},
+		{name: "user group named ip", in: `(?P<ip>[0-9.]+)`, groups: 1, wantSub: `(?P<ip>[0-9.]+)`},
+		{name: "go 1.22 spelling", in: `(?<ip>[0-9.]+)`, groups: 1, wantSub: `(?<ip>[0-9.]+)`},
+		{name: "go 1.22 spelling named IP", in: `(?<IP>[0-9.]+)`, wantSub: `(?<IP>[0-9.]+)`},
+		{name: "other group name", in: `(?P<user>\S+) from <IP>`, count: 1, groups: 1, wantSub: `(?P<user>\S+)`},
+		{name: "macro inside a named group", in: `(?P<outer><IP>)`, count: 1, groups: 1, wantSub: `(?P<outer>(?P<ip>`},
+		{name: "group name in a class is just text", in: `[(?P<]<IP>`, count: 1, groups: 1, wantSub: `[(?P<]`},
+		{name: "escaped paren is not a group", in: `\(?P<IP>`, count: 1, groups: 1, wantSub: `\(?P(?P<ip>`},
+		{name: "unnamed group", in: `(?:a|b) <IP>`, count: 1, groups: 1, wantSub: `(?:a|b) `},
 
 		// The documented decision: a macro inside a character class is an
 		// error rather than a silently wrong regex.
@@ -257,10 +353,10 @@ func TestExpandMacros(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			got, n, err := expandMacros(tc.in)
+			got, err := expandMacros(tc.in)
 			if tc.wantErr != "" {
 				if err == nil {
-					t.Fatalf("expandMacros(%q) = %q, want error containing %q", tc.in, got, tc.wantErr)
+					t.Fatalf("expandMacros(%q) = %q, want error containing %q", tc.in, got.pattern, tc.wantErr)
 				}
 				if !strings.Contains(err.Error(), tc.wantErr) {
 					t.Fatalf("error %q does not mention %q", err, tc.wantErr)
@@ -270,13 +366,77 @@ func TestExpandMacros(t *testing.T) {
 			if err != nil {
 				t.Fatalf("expandMacros(%q) error: %v", tc.in, err)
 			}
-			if n != tc.count {
-				t.Errorf("macro count = %d, want %d", n, tc.count)
+			if got.macros != tc.count {
+				t.Errorf("macro count = %d, want %d", got.macros, tc.count)
 			}
-			if tc.wantSub != "" && !strings.Contains(got, tc.wantSub) {
-				t.Errorf("expansion %q does not contain %q", got, tc.wantSub)
+			if got.ipGroups != tc.groups {
+				t.Errorf("ip group count = %d, want %d", got.ipGroups, tc.groups)
+			}
+			if tc.wantSub != "" && !strings.Contains(got.pattern, tc.wantSub) {
+				t.Errorf("expansion %q does not contain %q", got.pattern, tc.wantSub)
 			}
 		})
+	}
+}
+
+// A pattern the user wrote with their own (?P<IP>...) group has to compile and
+// run, not die inside the macro expander.
+func TestUserWrittenUppercaseGroup(t *testing.T) {
+	t.Parallel()
+	// The group is named "IP", not "ip", so it is not an address source: the
+	// pattern matches and reports no_ip, exactly as any other group would.
+	set, err := Compile(Spec{Line: []string{`from (?P<IP>[0-9.]+) port`}})
+	if err != nil {
+		t.Fatalf("Compile: %v", err)
+	}
+	if _, out := set.Match([]byte("from 1.2.3.4 port 22")); out != OutcomeNoIP {
+		t.Errorf("outcome = %v, want no_ip", out)
+	}
+	// Spelled as the extraction group, it is one.
+	got, out := matchOne(t, `from (?P<ip>[0-9.]+) port`, "from 1.2.3.4 port 22")
+	if out != OutcomeMatch || got != "1.2.3.4" {
+		t.Errorf("got (%q,%v), want (1.2.3.4, match)", got, out)
+	}
+}
+
+// expandMacros counts the ip groups compilePattern rejects duplicates by, so
+// its count has to agree with what the compiled regexp actually has. The
+// scanner is the authority precisely because regexp.Compile may one day refuse
+// the duplicate outright, so nothing else checks this.
+func TestIPGroupCountMatchesCompiled(t *testing.T) {
+	t.Parallel()
+	patterns := append([]string{
+		`(?P<ip>a)`,
+		`(?<ip>a)`,
+		`(?P<ip>a)|(?P<ip>b)`,
+		`<IP>`,
+		`<IP> -> <IP>`,
+		`<IP> (?P<ip>x)`,
+		`(?P<IP>a)`,
+		`(?P<user>a) (?P<ip>b)`,
+		`[(?P<ip>]`,
+		`\(?P<ip>x)`,
+		`plain`,
+	}, differentialPatterns...)
+
+	for _, src := range patterns {
+		exp, err := expandMacros(src)
+		if err != nil {
+			continue
+		}
+		re, err := regexp.Compile(exp.pattern)
+		if err != nil {
+			continue
+		}
+		want := 0
+		for _, name := range re.SubexpNames() {
+			if name == ipGroup {
+				want++
+			}
+		}
+		if exp.ipGroups != want {
+			t.Errorf("expandMacros(%q).ipGroups = %d, compiled regexp has %d", src, exp.ipGroups, want)
+		}
 	}
 }
 
@@ -421,14 +581,23 @@ func TestExpandMacrosDegenerateInput(t *testing.T) {
 		`<HOS`,
 		`[^`,
 		`[]`,
+		// An unterminated or malformed group name: the expander must not
+		// swallow it, so that the compiler's error is about the name.
+		`(?P<`,
+		`(?P<ip`,
+		`(?P<IP`,
+		`(?<`,
+		`(?<=x)`,
+		`(?P`,
+		`(`,
 	} {
-		got, _, err := expandMacros(in)
+		got, err := expandMacros(in)
 		if err != nil {
 			t.Errorf("expandMacros(%q) = error %v, want it to pass the text through", in, err)
 			continue
 		}
-		if !strings.Contains(got, strings.TrimSuffix(in, `\`)) && got != in {
-			t.Errorf("expandMacros(%q) = %q, want the text preserved", in, got)
+		if !strings.Contains(got.pattern, strings.TrimSuffix(in, `\`)) && got.pattern != in {
+			t.Errorf("expandMacros(%q) = %q, want the text preserved", in, got.pattern)
 		}
 	}
 }

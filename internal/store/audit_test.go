@@ -13,7 +13,8 @@ import (
 	"banhammer/internal/model"
 )
 
-// --- B1/B3: shutdown must never hand a directory over with state in memory.
+// --- Shutdown must never hand a state directory to another daemon while the
+// newest bans exist only in this process's memory.
 
 func TestCloseFailureKeepsLockAndIsSticky(t *testing.T) {
 	t.Parallel()
@@ -237,19 +238,10 @@ func TestDeferredWriteRetriesAreCapped(t *testing.T) {
 
 func TestRetryBackoffIsCapped(t *testing.T) {
 	t.Parallel()
-	dir := t.TempDir()
-	clk := newFakeClock()
-	sched := &fakeScheduler{}
-	s, err := OpenWith(dir, Options{
-		Log: discardLogger(), Now: clk.Now, AfterFunc: sched.AfterFunc,
-		BanInterval: 20 * time.Second, // 20s << 4 would be 320s without the cap
+	s, _, sched, rec := newTestStore(t, t.TempDir(), func(o *Options) {
+		o.BanInterval = 20 * time.Second // 20s << 4 would be 320s without the cap
 	})
-	if err != nil {
-		t.Fatalf("OpenWith: %v", err)
-	}
-	rec := &writeRecorder{inner: s.writeFile, fail: syscall.ENOSPC}
-	s.writeFile = rec.write
-	t.Cleanup(func() { rec.setFail(nil); _ = s.Close() })
+	rec.setFail(syscall.ENOSPC)
 
 	if err := s.SaveBans(sampleBans(t)); err != nil {
 		t.Fatalf("SaveBans: %v", err)
@@ -262,7 +254,8 @@ func TestRetryBackoffIsCapped(t *testing.T) {
 	}
 }
 
-// --- B2: Lookup must be deterministic when two monitors watch one file.
+// --- Two monitors watching one log file is a normal configuration, so Lookup
+// must resolve the collision the same way every time.
 
 func TestLookupCollisionPrefersTheFurthestOffset(t *testing.T) {
 	t.Parallel()
@@ -333,7 +326,8 @@ func TestLookupPrefersExactKeyMatch(t *testing.T) {
 	}
 }
 
-// --- N1: debris from an interrupted write.
+// --- Debris from a write that was interrupted by a crash must be cleaned up
+// at Open, and only debris.
 
 func TestOpenSweepsInterruptedWriteDebris(t *testing.T) {
 	t.Parallel()
@@ -393,7 +387,9 @@ func TestRenameFailureDebrisIsSweptAtNextOpen(t *testing.T) {
 	}
 }
 
-// --- N3: clamp absurd-but-parseable values at the quarantine boundary.
+// --- Values that parse but cannot be true (a ban that expires before it
+// started, a negative file offset) are dropped or clamped at this boundary so
+// downstream code never has to defend itself against them.
 
 func TestLoadClampsHostileValues(t *testing.T) {
 	t.Parallel()
@@ -457,7 +453,8 @@ func TestLoadClampsHostileValues(t *testing.T) {
 	})
 }
 
-// --- N5: a huge state file must not be read into memory.
+// --- A state file far larger than anything this daemon writes is garbage,
+// and must be refused before it is read into memory.
 
 func TestOversizedStateFileIsQuarantined(t *testing.T) {
 	t.Parallel()
@@ -478,31 +475,80 @@ func TestOversizedStateFileIsQuarantined(t *testing.T) {
 		t.Fatalf("LoadBans = %v, want empty state", bans)
 	}
 	assertQuarantined(t, dir, BansFile, big)
+}
 
+// TestMaxStateFileSizeIsPinned guards the constant itself: the number is part
+// of the daemon's memory bound, so a change to it should be a deliberate edit
+// here and not a side effect of some other work.
+func TestMaxStateFileSizeIsPinned(t *testing.T) {
+	t.Parallel()
 	if MaxStateFileSize != 64<<20 {
 		t.Errorf("MaxStateFileSize = %d, want 64 MiB", MaxStateFileSize)
 	}
 }
 
+// TestOversizedOffsetsFileIsQuarantinedAtOpen covers the path no LoadOffsets
+// call can reach: offsets.json is read inside Open, so an unreadable one has
+// to be quarantined there or the daemon never starts. The cap is injected
+// rather than exceeded — a 64 MiB fixture would be absurd in a unit test.
 func TestOversizedOffsetsFileIsQuarantinedAtOpen(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	big := `{"version":1,"offsets":{}}` + strings.Repeat(" ", 1<<20)
+	big := `{"version":1,"offsets":{"/a.log":{"path":"/a.log","offset":7}}}`
 	if err := os.WriteFile(filepath.Join(dir, OffsetsFile), []byte(big), 0o644); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	// The real cap is what is exercised here; 1 MiB is under it, so this also
-	// documents that a merely large file is still read.
-	s, _, _, _ := newTestStore(t, dir)
+
+	s, _, _, _ := newTestStore(t, dir, func(o *Options) { o.maxFileSize = 16 })
 	offsets, err := s.LoadOffsets()
 	if err != nil {
 		t.Fatalf("LoadOffsets: %v", err)
 	}
 	if len(offsets) != 0 {
-		t.Errorf("offsets = %v, want empty", offsets)
+		t.Errorf("offsets = %v, want empty state after quarantine", offsets)
+	}
+	if _, ok := s.Lookup("/a.log"); ok {
+		t.Error("Lookup answered from a file that was too large to read")
+	}
+	assertQuarantined(t, dir, OffsetsFile, big)
+
+	// The daemon carries on: a fresh save works and is what a restart sees.
+	if err := s.SaveOffsets(map[string]model.Checkpoint{"/b.log": {Path: "/b.log", Offset: 1}}); err != nil {
+		t.Fatalf("SaveOffsets after quarantine: %v", err)
+	}
+	if _, ok := s.Lookup("/b.log"); !ok {
+		t.Error("store unusable after an oversized file was set aside")
+	}
+}
+
+// TestLargeButUnderCapOffsetsFileIsRead is the other side of the cap: 1 MiB is
+// nowhere near 64 MiB, so the file must be parsed, not set aside. It used to
+// be named as if it asserted a quarantine and would have passed with the size
+// logic deleted.
+func TestLargeButUnderCapOffsetsFileIsRead(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	// Padding inside the JSON, so the file is genuinely large and genuinely
+	// parseable.
+	big := `{"version":1,"offsets":{"/a.log":{"path":"/a.log","offset":4096}}}` +
+		strings.Repeat(" ", 1<<20)
+	if err := os.WriteFile(filepath.Join(dir, OffsetsFile), []byte(big), 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	s, _, _, _ := newTestStore(t, dir)
+	offsets, err := s.LoadOffsets()
+	if err != nil {
+		t.Fatalf("LoadOffsets: %v", err)
+	}
+	if len(offsets) != 1 || offsets["/a.log"].Offset != 4096 {
+		t.Errorf("offsets = %+v, want the checkpoint from the file", offsets)
+	}
+	if cp, ok := s.Lookup("/a.log"); !ok || cp.Offset != 4096 {
+		t.Errorf("Lookup = %+v, %v; want the checkpoint from the file", cp, ok)
 	}
 	if _, err := os.Stat(filepath.Join(dir, OffsetsFile+CorruptSuffix)); err == nil {
-		t.Error("a 1 MiB file was quarantined although it is under the cap")
+		t.Error("a 1 MiB file was quarantined although it is far under the cap")
 	}
 }
 
@@ -552,5 +598,168 @@ func TestErrorsAreDistinguishable(t *testing.T) {
 	}
 	if errors.Is(err, ErrClosed) {
 		t.Error("a write failure must not look like a closed store")
+	}
+}
+
+// TestDirFsyncFailureIsNotCalledDataLoss pins the weaker sentinel. A rename
+// that landed but could not be fsynced leaves the new state visible to the
+// next reader; calling that "not persisted" would make the shutdown path
+// refuse to release a directory whose contents are in fact correct.
+func TestDirFsyncFailureIsNotCalledDataLoss(t *testing.T) {
+	t.Parallel()
+	s, _, _, rec := newTestStore(t, t.TempDir())
+	// What atomicWrite reports when only the directory fsync fails.
+	rec.setFail(fmt.Errorf("durability of bans.json: %w: %w", ErrNotDurable, syscall.EIO))
+
+	err := s.SaveOffsets(map[string]model.Checkpoint{"/a": {Path: "/a"}})
+	if !errors.Is(err, ErrNotDurable) {
+		t.Errorf("error = %v, want ErrNotDurable", err)
+	}
+	if errors.Is(err, ErrNotPersisted) {
+		t.Errorf("error = %v, want it *not* to claim the state is only in memory", err)
+	}
+	if !errors.Is(err, syscall.EIO) {
+		t.Errorf("error = %v, want the cause preserved", err)
+	}
+	// The two sentinels must stay distinguishable in both directions.
+	if errors.Is(ErrNotDurable, ErrNotPersisted) || errors.Is(ErrNotPersisted, ErrNotDurable) {
+		t.Error("ErrNotDurable and ErrNotPersisted are not distinguishable")
+	}
+}
+
+// --- Repeated problems must be summarised, not repeated: PROJECT.md §4.9
+// asks for rate-limited logging, and one bad file can hold 50k bad entries.
+
+func TestDroppedBanEntriesAreReportedInOneLine(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+
+	const badEntries = 500
+	var b strings.Builder
+	b.WriteString(`{"version":1,"bans":[`)
+	for i := 0; i < badEntries; i++ {
+		fmt.Fprintf(&b, `{"ip":"","monitor":"broken","at":"2024-01-01T00:00:00Z","until":"2024-01-01T01:00:00Z"},`)
+	}
+	b.WriteString(`{"ip":"8.8.8.8","monitor":"backwards","at":"2024-01-02T00:00:00Z","until":"2024-01-01T00:00:00Z"},`)
+	b.WriteString(`{"ip":"9.9.9.9","monitor":"ok","at":"2024-01-01T00:00:00Z","until":"2024-01-01T01:00:00Z"}]}`)
+	if err := os.WriteFile(filepath.Join(dir, BansFile), []byte(b.String()), 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	logs := &logCapture{}
+	s, _, _, _ := newTestStore(t, dir, func(o *Options) { o.Log = logs.logger() })
+	bans, err := s.LoadBans()
+	if err != nil {
+		t.Fatalf("LoadBans: %v", err)
+	}
+	if len(bans) != 1 || bans[0].Monitor != "ok" {
+		t.Fatalf("LoadBans = %+v, want only the valid entry", bans)
+	}
+
+	records := logs.withMessage("dropped unusable ban entries")
+	if len(records) != 1 {
+		t.Fatalf("logged %d lines for %d unusable entries, want exactly 1", len(records), badEntries+1)
+	}
+	for _, tc := range []struct {
+		key  string
+		want any
+	}{
+		{"dropped", int64(badEntries + 1)},
+		{"kept", int64(1)},
+		{"invalid_address", int64(badEntries)},
+		{"expires_before_start", int64(1)},
+	} {
+		if got := attr(records[0], tc.key); got != tc.want {
+			t.Errorf("%s = %v, want %v", tc.key, got, tc.want)
+		}
+	}
+	// A count with no example is not actionable.
+	if got, _ := attr(records[0], "example").(string); got == "" {
+		t.Error("the summary carries no example of what was dropped")
+	}
+}
+
+func TestCheckpointClashIsLoggedOncePerResolution(t *testing.T) {
+	t.Parallel()
+	const (
+		path = "/var/log/auth.log"
+		msg  = "several checkpoints name the same file; resuming from the furthest one"
+	)
+	logs := &logCapture{}
+	s, _, _, _ := newTestStore(t, t.TempDir(), func(o *Options) { o.Log = logs.logger() })
+
+	// Two monitors tailing one file, both advancing: the daemon saves this
+	// every 5s for as long as it runs.
+	for i := 1; i <= 5; i++ {
+		if err := s.SaveOffsets(map[string]model.Checkpoint{
+			"sshd":        {Path: path, Offset: int64(10 * i)},
+			"sshd-strict": {Path: path, Offset: int64(1000 * i)},
+		}); err != nil {
+			t.Fatalf("SaveOffsets #%d: %v", i, err)
+		}
+	}
+	records := logs.withMessage(msg)
+	if len(records) != 1 {
+		t.Fatalf("logged %d warnings for 5 saves of the same clash, want 1", len(records))
+	}
+	if got, want := attr(records[0], "kept_key"), "sshd-strict"; got != want {
+		t.Errorf("kept_key = %v, want %v", got, want)
+	}
+	if got, want := attr(records[0], "kept_offset"), int64(1000); got != want {
+		t.Errorf("kept_offset = %v, want %v", got, want)
+	}
+	if got, want := attr(records[0], "discarded_offset"), int64(10); got != want {
+		t.Errorf("discarded_offset = %v, want %v", got, want)
+	}
+	// The old pair logged both numbers under one key, which left the reader
+	// guessing which one was used.
+	if got := attr(records[0], "offsets"); got != nil {
+		t.Errorf("offsets = %v, want the two values under distinct keys", got)
+	}
+
+	// A different entry winning is news; the same one winning again is not.
+	logs.reset()
+	if err := s.SaveOffsets(map[string]model.Checkpoint{
+		"sshd":        {Path: path, Offset: 99999},
+		"sshd-strict": {Path: path, Offset: 5000},
+	}); err != nil {
+		t.Fatalf("SaveOffsets: %v", err)
+	}
+	if n := len(logs.withMessage(msg)); n != 1 {
+		t.Errorf("logged %d warnings when the winner changed, want 1", n)
+	}
+	if got, want := attr(logs.withMessage(msg)[0], "kept_key"), "sshd"; got != want {
+		t.Errorf("kept_key = %v, want %v", got, want)
+	}
+
+	logs.reset()
+	if err := s.SaveOffsets(map[string]model.Checkpoint{
+		"sshd":        {Path: path, Offset: 100000},
+		"sshd-strict": {Path: path, Offset: 5000},
+	}); err != nil {
+		t.Fatalf("SaveOffsets: %v", err)
+	}
+	if n := len(logs.withMessage(msg)); n != 0 {
+		t.Errorf("logged %d warnings for an unchanged resolution, want 0", n)
+	}
+
+	// A clash that goes away and comes back is worth hearing about again.
+	logs.reset()
+	if err := s.SaveOffsets(map[string]model.Checkpoint{
+		"sshd": {Path: path, Offset: 100000},
+	}); err != nil {
+		t.Fatalf("SaveOffsets: %v", err)
+	}
+	if n := len(logs.withMessage(msg)); n != 0 {
+		t.Errorf("logged %d warnings with only one monitor left, want 0", n)
+	}
+	if err := s.SaveOffsets(map[string]model.Checkpoint{
+		"sshd":        {Path: path, Offset: 100000},
+		"sshd-strict": {Path: path, Offset: 200000},
+	}); err != nil {
+		t.Fatalf("SaveOffsets: %v", err)
+	}
+	if n := len(logs.withMessage(msg)); n != 1 {
+		t.Errorf("logged %d warnings when the clash returned, want 1", n)
 	}
 }

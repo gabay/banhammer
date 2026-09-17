@@ -95,11 +95,15 @@ func writeSettings(b *strings.Builder, indent int, s Settings) {
 
 // actionLines renders the backend and, for cmd, the templates that will be run.
 func actionLines(a ActionSpec) []string {
-	head := fmt.Sprintf("%s (timeout %s", a.Name, fmtDur(a.Timeout))
-	if a.Shell {
-		head += ", via shell"
+	var parts []string
+	if a.Chain != "" && a.Chain != defaultActionChain {
+		parts = append(parts, "chain "+a.Chain)
 	}
-	head += ")"
+	parts = append(parts, "timeout "+fmtDur(a.Timeout))
+	if a.Shell {
+		parts = append(parts, "via shell")
+	}
+	head := fmt.Sprintf("%s (%s)", a.Name, strings.Join(parts, ", "))
 	lines := []string{head}
 	for _, t := range []struct{ name, tmpl string }{
 		{"start", a.Start}, {"ban", a.Ban}, {"unban", a.Unban}, {"stop", a.Stop},

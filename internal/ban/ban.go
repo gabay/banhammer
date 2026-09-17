@@ -91,15 +91,14 @@ type Options struct {
 	// LocalInterfacePrefixes; injected so tests do not depend on the machine's
 	// NICs. Whatever it returns is used verbatim (masked), so returning a
 	// subnet exempts that whole subnet.
-	// NOT in docs/CONTRACTS.md — see the package report.
 	Interfaces InterfaceLister
 	// NewTimer builds the single scheduler timer. Defaults to NewRealTimer;
-	// injected so expiry tests run instantly. NOT in docs/CONTRACTS.md.
+	// injected so expiry tests run instantly.
 	NewTimer func(time.Duration) Timer
 }
 
 // Stats are lifetime counters, exposed for the metrics endpoint and for
-// `banhammer status`. Not part of docs/CONTRACTS.md.
+// `banhammer status`.
 type Stats struct {
 	Active          int    // bans currently enforced
 	Banned          uint64 // new bans issued
@@ -108,6 +107,20 @@ type Stats struct {
 	Expired         uint64 // unbans driven by the scheduler
 	Allowlisted     uint64 // offenses dropped by the allowlist
 	PersistFailures uint64
+}
+
+// MonitorStats is the slice of Stats attributable to one monitor, for the
+// metrics endpoint's per-monitor labels.
+//
+// These are a projection of the manager's own state rather than a tally of
+// Enforcer calls, which matters on startup: Restore re-pushes live bans to the
+// firewall, and counting those calls would make every daemon restart look like
+// a fresh wave of bans and drive an active-ban gauge negative when a persisted
+// ban turns out to have expired.
+type MonitorStats struct {
+	Active   int    // bans currently enforced for this monitor
+	Banned   uint64 // new bans issued (extensions and restores excluded)
+	Unbanned uint64 // bans lifted, whether by expiry or by hand
 }
 
 // historyKey scopes offense history per monitor, because Policy (and therefore
@@ -158,6 +171,11 @@ type Manager struct {
 	offenses int    // offenses since the last history sweep
 	seq      uint64 // monotonic state version, for persistence ordering
 
+	// perMonitor is the label-sliced version of counters, for the metrics
+	// endpoint. It lives under mu rather than in atomics because it is written
+	// on paths that already hold the lock and is read only at scrape time.
+	perMonitor map[string]MonitorStats
+
 	// persistMu serialises writes; persisted is the highest seq written, so a
 	// snapshot that lost the race is dropped instead of overwriting newer state.
 	persistMu sync.Mutex
@@ -184,6 +202,7 @@ func NewManager(o Options) *Manager {
 		bans:       make(map[netip.Addr]model.Ban),
 		sched:      newBanHeap(),
 		history:    make(map[historyKey][]time.Time),
+		perMonitor: make(map[string]MonitorStats),
 	}
 	if m.now == nil {
 		m.now = time.Now
@@ -246,11 +265,14 @@ func (m *Manager) policyLocked(monitor string) Policy {
 // returns an error: an allowlisted address is a silent no-op and a persistence
 // failure is logged and counted, because neither should stop the pipeline.
 //
+// pattern is the rule that caught the offender (rule.Result.Pattern), stored on
+// the ban record and surfaced to actions as {matched}. It may be empty.
+//
 // The offense counter that drives escalation counts *bans*, not threshold
 // crossings: while a ban is live, further crossings for the same IP change
 // nothing (under OnRepeat "ignore"), so counting them would let a flood
 // fast-forward an attacker to BantimeMax and would grow history without bound.
-func (m *Manager) Offend(monitor string, ip netip.Addr, count int) {
+func (m *Manager) Offend(monitor string, ip netip.Addr, count int, pattern string) {
 	ip = ip.Unmap().WithZone("")
 	if !ip.IsValid() {
 		m.log.Warn("ignoring offense for invalid address", "monitor", monitor)
@@ -298,6 +320,7 @@ func (m *Manager) Offend(monitor string, ip netip.Addr, count int) {
 		existing.Count = count
 		existing.Offense = offense
 		existing.Monitor = monitor
+		existing.Matched = pattern
 		m.bans[ip] = existing
 		m.sched.schedule(ip, until)
 		m.commitOffenseLocked(key, hist, now)
@@ -310,14 +333,25 @@ func (m *Manager) Offend(monitor string, ip netip.Addr, count int) {
 		m.signal()
 		m.persist(seq, snap)
 	default:
-		b := model.Ban{IP: ip, Monitor: monitor, At: now, Until: until, Count: count, Offense: offense}
+		b := model.Ban{
+			IP:      ip,
+			Monitor: monitor,
+			At:      now,
+			Until:   until,
+			Count:   count,
+			Offense: offense,
+			Matched: pattern,
+		}
 		if banned {
 			// Expired but still in the map: Run is not draining (shutdown, or
-			// no Run at all). Replace it rather than leaking the old entry.
+			// no Run at all). Replace it rather than leaking the old entry —
+			// and do not re-enforce, because the rule from the entry we are
+			// replacing was never removed.
 			m.log.Debug("replacing expired ban still in state", "ip", ip, "until", existing.Until)
 		}
-		m.applyLocked(b)
+		m.applyLocked(b, !banned)
 		m.commitOffenseLocked(key, hist, now)
+		m.countBannedLocked(monitor)
 		snap, seq := m.stateLocked()
 		m.mu.Unlock()
 		m.counters.banned.Add(1)
@@ -332,6 +366,11 @@ func (m *Manager) Offend(monitor string, ip netip.Addr, count int) {
 // Unlike Offend it reports an allowlisted address as an error: an operator
 // typing `banhammer ban` deserves to be told why nothing happened. It never
 // shortens a live ban — use Unban then Ban for that.
+//
+// Re-banning an address that is already banned only updates the record. The
+// firewall is deliberately left alone: the rule is already installed, and with
+// iptables a second -I would stack a duplicate that a single -D would not
+// clear. This mirrors Restore and the extend branch of Offend.
 func (m *Manager) Ban(ip netip.Addr, monitor string, d time.Duration) error {
 	ip = ip.Unmap().WithZone("")
 	if !ip.IsValid() {
@@ -349,31 +388,35 @@ func (m *Manager) Ban(ip netip.Addr, monitor string, d time.Duration) error {
 	}
 	until := now.Add(d)
 	b := model.Ban{IP: ip, Monitor: monitor, At: now, Until: until, Count: 0, Offense: 1}
-	if existing, ok := m.bans[ip]; ok && !existing.Expired(now) {
+	existing, live := m.bans[ip]
+	live = live && !existing.Expired(now)
+	if live {
 		b = existing
 		b.Monitor = monitor
-		b.Offense = existing.Offense
 		if until.After(existing.Until) {
 			b.Until = until
 			m.counters.extended.Add(1)
 		}
 	} else {
 		m.counters.banned.Add(1)
+		m.countBannedLocked(monitor)
 	}
-	m.applyLocked(b)
+	m.applyLocked(b, !live)
 	snap, seq := m.stateLocked()
 	m.mu.Unlock()
 
-	m.log.Info("banned manually", "ip", ip, "monitor", monitor, "until", b.Until)
+	m.log.Info("banned manually", "ip", ip, "monitor", monitor, "until", b.Until, "already_banned", live)
 	m.signal()
 	return m.persist(seq, snap)
 }
 
-// applyLocked installs b (new or replacing) and enforces it. m.mu must be held.
-func (m *Manager) applyLocked(b model.Ban) {
+// applyLocked installs b and, when enforce is set, pushes it to the firewall.
+// Callers pass enforce=false for a record that is merely being updated, since
+// a backend's Ban is an insert, not an upsert. m.mu must be held.
+func (m *Manager) applyLocked(b model.Ban, enforce bool) {
 	m.bans[b.IP] = b
 	m.sched.schedule(b.IP, b.Until)
-	if m.enforcer != nil {
+	if enforce && m.enforcer != nil {
 		m.enforcer.Ban(b)
 	}
 }
@@ -420,9 +463,42 @@ func (m *Manager) UnbanAll() error {
 func (m *Manager) dropLocked(b model.Ban) {
 	delete(m.bans, b.IP)
 	m.sched.remove(b.IP)
+	m.countUnbannedLocked(b.Monitor)
 	if m.enforcer != nil {
 		m.enforcer.Unban(b)
 	}
+}
+
+// countBannedLocked and countUnbannedLocked maintain the per-monitor
+// projection returned by StatsByMonitor. m.mu must be held.
+func (m *Manager) countBannedLocked(monitor string) {
+	s := m.perMonitor[monitor]
+	s.Banned++
+	m.perMonitor[monitor] = s
+}
+
+func (m *Manager) countUnbannedLocked(monitor string) {
+	s := m.perMonitor[monitor]
+	s.Unbanned++
+	m.perMonitor[monitor] = s
+}
+
+// StatsByMonitor returns the per-monitor counters, including an entry for every
+// monitor that has ever been banned or unbanned so a scrape keeps reporting a
+// counter after its last ban expires.
+func (m *Manager) StatsByMonitor() map[string]MonitorStats {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make(map[string]MonitorStats, len(m.perMonitor))
+	for name, s := range m.perMonitor {
+		out[name] = s
+	}
+	for _, b := range m.bans {
+		s := out[b.Monitor]
+		s.Active++
+		out[b.Monitor] = s
+	}
+	return out
 }
 
 // Restore re-applies bans loaded from disk. It runs on every start, so it must
@@ -436,6 +512,10 @@ func (m *Manager) dropLocked(b model.Ban) {
 // A ban for an unknown monitor is still enforced: the firewall rule is real
 // regardless of config churn, and dropping it would silently release an
 // attacker because someone renamed a jail.
+//
+// Restored bans are not counted as new bans: they were counted by the run that
+// issued them, and counting them again would make every restart look like a
+// fresh wave of attacks.
 func (m *Manager) Restore(bans []model.Ban) error {
 	m.mu.Lock()
 	now := m.now()
@@ -469,7 +549,8 @@ func (m *Manager) Restore(bans []model.Ban) error {
 			m.log.Warn("restored ban references an unknown monitor; still enforcing",
 				"ip", b.IP, "monitor", b.Monitor)
 		}
-		if prev, ok := m.bans[b.IP]; ok {
+		prev, held := m.bans[b.IP]
+		if held {
 			dupes++
 			// Keep the longest term: whichever record is the most recent
 			// truth, releasing early is the worse failure.
@@ -481,7 +562,9 @@ func (m *Manager) Restore(bans []model.Ban) error {
 			b.Offense = 1
 		}
 		live++
-		m.applyLocked(b)
+		// held means a rule is already installed for this address, so only the
+		// record is updated.
+		m.applyLocked(b, !held)
 	}
 
 	snap, seq := m.stateLocked()
@@ -543,6 +626,7 @@ func (m *Manager) expireAndSchedule() time.Duration {
 			continue
 		}
 		delete(m.bans, b.IP)
+		m.countUnbannedLocked(b.Monitor)
 		if m.enforcer != nil {
 			m.enforcer.Unban(b)
 		}

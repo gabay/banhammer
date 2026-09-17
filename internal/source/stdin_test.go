@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"log/slog"
 	"os"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -94,8 +94,8 @@ func TestStdinRunRejectsNilChannel(t *testing.T) {
 // With an *os.File pipe the reader supports deadlines, so cancellation is
 // prompt and the source leaves no goroutine behind.
 func TestStdinPipeCancelPromptlyWithoutLeaking(t *testing.T) {
-	t.Parallel()
-	before := runtime.NumGoroutine()
+	// Not parallel: this counts goroutines (see sourceGoroutines).
+	before := sourceGoroutines()
 
 	r, w, err := os.Pipe()
 	if err != nil {
@@ -166,6 +166,86 @@ func TestStdinBlockingReaderCancels(t *testing.T) {
 		t.Fatal("Run did not return while a blocking read was in flight")
 	}
 	close(release) // let the abandoned goroutine finish so the test is clean
+}
+
+// The abandoned reader goroutine must never send on the caller's channel after
+// Run has returned.
+//
+// daemon/pipeline.go closes the channel the moment Run returns, so a line that
+// surfaces from the in-flight read a moment later used to panic the whole
+// daemon with "send on closed channel" at shutdown — reachable with nothing
+// more exotic than `banhammer run --stdin < auth.log`, since a regular
+// *os.File has no read deadline. This test reproduces that shape exactly: the
+// reader yields a line only *after* cancellation, and the channel is closed as
+// soon as Run returns.
+func TestStdinAbandonedReaderCannotSendOnClosedChannel(t *testing.T) {
+	t.Parallel()
+	before := sourceGoroutines()
+
+	cancelled := make(chan struct{})
+	r := &lateLineReader{afterClose: cancelled}
+	s, err := NewStdin("mon", r, nil)
+	if err != nil {
+		t.Fatalf("NewStdin: %v", err)
+	}
+
+	out := make(chan model.Event) // unbuffered, like the pipeline's own
+	ctx, cancel := context.WithCancel(context.Background())
+	errc := make(chan error, 1)
+	go func() { errc <- s.Run(ctx, out) }()
+
+	cancel()
+	select {
+	case err := <-errc:
+		if err != nil {
+			t.Fatalf("Run = %v, want nil on cancellation", err)
+		}
+	case <-time.After(waitTimeout):
+		t.Fatal("Run did not return after cancellation")
+	}
+	// Exactly what the pipeline does next. If the reader goroutine still held
+	// this channel, the send below would panic in that goroutine and take the
+	// test binary with it.
+	close(out)
+	close(cancelled) // now let the blocked read produce its line
+
+	// The abandoned goroutine must also go away rather than park forever on a
+	// send nobody will ever receive.
+	assertNoLeak(t, before)
+}
+
+// lateLineReader blocks until afterClose is closed, then returns a line — the
+// racy shape of a read that was in flight when the daemon shut down.
+type lateLineReader struct {
+	afterClose chan struct{}
+	done       bool
+}
+
+func (r *lateLineReader) Read(p []byte) (int, error) {
+	if r.done {
+		return 0, io.EOF
+	}
+	<-r.afterClose
+	r.done = true
+	return copy(p, "too-late\n"), nil
+}
+
+// Over-long lines are truncated and *counted* (PROJECT.md §4.1); the count has
+// to be readable, not just logged.
+func TestStdinCountsTruncatedLines(t *testing.T) {
+	t.Parallel()
+	input := strings.Repeat("q", maxLineBytes+10) + "\nshort\n" + strings.Repeat("z", maxLineBytes+1) + "\n"
+	s, err := NewStdin("mon", strings.NewReader(input), slog.New(slog.DiscardHandler))
+	if err != nil {
+		t.Fatalf("NewStdin: %v", err)
+	}
+	out := make(chan model.Event, 8)
+	if err := s.Run(context.Background(), out); err != nil {
+		t.Fatalf("Run = %v", err)
+	}
+	if got := s.(StatsReporter).Stats().TruncatedLines; got != 2 {
+		t.Errorf("Stats().TruncatedLines = %d, want 2", got)
+	}
 }
 
 // blockingReader blocks until released, then reports EOF.

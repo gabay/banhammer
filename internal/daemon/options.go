@@ -14,9 +14,15 @@ import (
 type Option func(*Daemon)
 
 // WithLogger sets the structured logger for the daemon.
-// If unset or nil, slog.Default() is used.
+//
+// A nil logger falls back to slog.Default() rather than being stored: every
+// stage of the pipeline logs unconditionally, so a nil here would surface as a
+// panic far from the call site.
 func WithLogger(log *slog.Logger) Option {
 	return func(d *Daemon) {
+		if log == nil {
+			log = slog.Default()
+		}
 		d.log = log
 	}
 }

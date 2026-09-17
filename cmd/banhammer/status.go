@@ -18,12 +18,15 @@ func newStatusCmd(root *rootFlags) *cobra.Command {
 		Short: "Query daemon status, active bans, and pipeline metrics",
 		Long:  "Status connects to the running daemon via the Unix domain control socket and displays daemon uptime, operational counters, monitored inputs, and active bans.",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			socketPath := resolveSocketPath(root.socket, root.config)
+			socketPath, err := resolveSocketPath(root.socket, root.config)
+			if err != nil {
+				return err
+			}
 			client := control.NewClient(socketPath)
 
 			resp, err := client.Status(cmd.Context())
 			if err != nil {
-				return fmt.Errorf("get daemon status: %w", err)
+				return daemonError("get daemon status", socketPath, err)
 			}
 
 			if jsonOutput {
@@ -42,6 +45,10 @@ func newStatusCmd(root *rootFlags) *cobra.Command {
 			fmt.Fprintf(out, "  Lines Read:     %d\n", resp.Stats.LinesRead)
 			fmt.Fprintf(out, "  Lines Dropped:  %d\n", resp.Stats.LinesDropped)
 			fmt.Fprintf(out, "  Matches:        %d\n", resp.Stats.Matches)
+			fmt.Fprintf(out, "  Tracked IPs:    %d\n", resp.Stats.TrackedIPs)
+			// The ban list below is the authoritative answer for "how many are
+			// banned right now", so it is counted rather than trusting the
+			// gauge, which a scrape may not have refreshed.
 			fmt.Fprintf(out, "  Active Bans:    %d\n", len(resp.Bans))
 			fmt.Fprintf(out, "  Total Bans:     %d\n", resp.Stats.BansTotal)
 			fmt.Fprintf(out, "  Total Unbans:   %d\n", resp.Stats.UnbansTotal)

@@ -1,10 +1,12 @@
 package control
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/netip"
 	"os"
@@ -78,9 +80,24 @@ func (m *mockService) Reload() error {
 	return m.reloadErr
 }
 
+// tempSocket returns a socket path inside a short-lived directory.
+//
+// t.TempDir() bakes the test and subtest names into the path, which already
+// runs to ~103 bytes here and goes over the 108-byte sun_path limit on a host
+// with a longer TMPDIR. os.MkdirTemp("", "bh") keeps it short.
+func tempSocket(t *testing.T, name string) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "bh")
+	if err != nil {
+		t.Fatalf("MkdirTemp failed: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return filepath.Join(dir, name)
+}
+
 func startTestServer(t *testing.T, svc Service, opts ...ServerOption) (*Server, string) {
 	t.Helper()
-	sock := filepath.Join(t.TempDir(), "control.sock")
+	sock := tempSocket(t, "control.sock")
 	srv, err := NewServer(sock, svc, nil, opts...)
 	if err != nil {
 		t.Fatalf("NewServer failed: %v", err)
@@ -97,6 +114,9 @@ func startTestServer(t *testing.T, svc Service, opts ...ServerOption) (*Server, 
 
 	select {
 	case <-srv.Ready():
+		if err := srv.Err(); err != nil {
+			t.Fatalf("Server failed to bind: %v", err)
+		}
 	case err := <-errc:
 		t.Fatalf("Server failed to bind: %v", err)
 	}
@@ -439,7 +459,7 @@ func TestSocketCleanupAndStaleHandling(t *testing.T) {
 	mock := &mockService{}
 
 	t.Run("cleanup of socket file on server close", func(t *testing.T) {
-		sock := filepath.Join(t.TempDir(), "cleanup.sock")
+		sock := tempSocket(t, "cleanup.sock")
 		srv, err := NewServer(sock, mock, nil)
 		if err != nil {
 			t.Fatalf("NewServer failed: %v", err)
@@ -471,11 +491,63 @@ func TestSocketCleanupAndStaleHandling(t *testing.T) {
 		}
 	})
 
-	t.Run("removal of stale socket on startup", func(t *testing.T) {
-		sock := filepath.Join(t.TempDir(), "stale.sock")
-		// Write a dummy file where no process is listening.
-		if err := os.WriteFile(sock, []byte("stale socket content"), 0600); err != nil {
+	t.Run("refuses to touch a non-socket at the socket path", func(t *testing.T) {
+		// `banhammer run --socket /etc/banhammer/config.yaml` must not delete
+		// the config it was mistakenly pointed at.
+		path := tempSocket(t, "config.yaml")
+		const content = "state_dir: /var/lib/banhammer\n"
+		if err := os.WriteFile(path, []byte(content), 0600); err != nil {
 			t.Fatalf("WriteFile failed: %v", err)
+		}
+
+		srv, err := NewServer(path, mock, nil)
+		if err != nil {
+			t.Fatalf("NewServer failed: %v", err)
+		}
+		t.Cleanup(func() { _ = srv.Close() })
+
+		runErr := srv.Run(context.Background())
+		if !errors.Is(runErr, ErrNotASocket) {
+			t.Fatalf("expected error wrapping ErrNotASocket, got: %v", runErr)
+		}
+
+		// Ready must fire even on failure, and Err must explain why.
+		select {
+		case <-srv.Ready():
+		case <-time.After(2 * time.Second):
+			t.Fatal("Ready was never closed after a failed bind")
+		}
+		if !errors.Is(srv.Err(), ErrNotASocket) {
+			t.Fatalf("Err() = %v, want ErrNotASocket", srv.Err())
+		}
+
+		// Neither Run nor Close may have removed the file.
+		_ = srv.Close()
+		got, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("the operator's file was deleted: %v", err)
+		}
+		if string(got) != content {
+			t.Fatalf("file content changed: got %q, want %q", got, content)
+		}
+	})
+
+	t.Run("removal of stale socket on startup", func(t *testing.T) {
+		// A genuine socket with nobody listening: what a crashed daemon leaves.
+		sock := tempSocket(t, "stale.sock")
+		dead, err := net.Listen("unix", sock)
+		if err != nil {
+			t.Fatalf("net.Listen failed: %v", err)
+		}
+		// Close the listener without unlinking, mimicking SIGKILL.
+		if ul, ok := dead.(*net.UnixListener); ok {
+			ul.SetUnlinkOnClose(false)
+		}
+		if err := dead.Close(); err != nil {
+			t.Fatalf("closing seed listener: %v", err)
+		}
+		if _, err := os.Lstat(sock); err != nil {
+			t.Fatalf("expected the stale socket to survive its listener: %v", err)
 		}
 
 		srv, err := NewServer(sock, mock, nil)
@@ -489,6 +561,9 @@ func TestSocketCleanupAndStaleHandling(t *testing.T) {
 		go func() { _ = srv.Run(ctx) }()
 		<-srv.Ready()
 		defer srv.Close()
+		if err := srv.Err(); err != nil {
+			t.Fatalf("bind over stale socket failed: %v", err)
+		}
 
 		// Verify client can connect and issue commands on the recovered socket
 		client := NewClient(sock)
@@ -497,8 +572,44 @@ func TestSocketCleanupAndStaleHandling(t *testing.T) {
 		}
 	})
 
+	t.Run("socket and parent directory are not world-reachable", func(t *testing.T) {
+		base := tempSocket(t, "run")
+		sock := filepath.Join(base, "control.sock")
+
+		srv, err := NewServer(sock, mock, nil)
+		if err != nil {
+			t.Fatalf("NewServer failed: %v", err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		go func() { _ = srv.Run(ctx) }()
+		<-srv.Ready()
+		defer srv.Close()
+		if err := srv.Err(); err != nil {
+			t.Fatalf("bind failed: %v", err)
+		}
+
+		fi, err := os.Stat(sock)
+		if err != nil {
+			t.Fatalf("stat socket: %v", err)
+		}
+		if got := fi.Mode().Perm(); got != defaultSocketMode {
+			t.Errorf("socket mode = %v, want %v", got, defaultSocketMode)
+		}
+
+		di, err := os.Stat(base)
+		if err != nil {
+			t.Fatalf("stat socket directory: %v", err)
+		}
+		// The umask may clear further bits; what must never survive is
+		// anything for "other".
+		if got := di.Mode().Perm(); got&0o007 != 0 {
+			t.Errorf("socket directory mode = %v, want no world access", got)
+		}
+	})
+
 	t.Run("refuses bind when socket actively in use", func(t *testing.T) {
-		sock := filepath.Join(t.TempDir(), "inuse.sock")
+		sock := tempSocket(t, "inuse.sock")
 		srv1, err := NewServer(sock, mock, nil)
 		if err != nil {
 			t.Fatalf("NewServer srv1: %v", err)
@@ -526,6 +637,21 @@ func TestSocketCleanupAndStaleHandling(t *testing.T) {
 		}
 		if !errors.Is(err2, ErrSocketInUse) {
 			t.Fatalf("expected error wrapping ErrSocketInUse, got: %v", err2)
+		}
+
+		// The losing server must not take the live daemon's socket with it:
+		// a second `banhammer run` against a different state_dir escapes the
+		// store lock, and unlinking here would leave srv1 running but
+		// permanently unreachable.
+		if err := srv2.Close(); err != nil {
+			t.Fatalf("srv2.Close: %v", err)
+		}
+		if _, err := os.Lstat(sock); err != nil {
+			t.Fatalf("srv2.Close deleted the live socket: %v", err)
+		}
+		client := NewClient(sock)
+		if err := client.Reload(ctx1); err != nil {
+			t.Fatalf("live server unreachable after srv2.Close: %v", err)
 		}
 	})
 }
@@ -604,7 +730,7 @@ func TestServerValidationAndLifecycle(t *testing.T) {
 	})
 
 	t.Run("concurrent Run calls return ErrRunning", func(t *testing.T) {
-		sock := filepath.Join(t.TempDir(), "running.sock")
+		sock := tempSocket(t, "running.sock")
 		srv, err := NewServer(sock, mock, nil)
 		if err != nil {
 			t.Fatalf("NewServer: %v", err)
@@ -622,7 +748,7 @@ func TestServerValidationAndLifecycle(t *testing.T) {
 	})
 
 	t.Run("Run after Close returns ErrClosed", func(t *testing.T) {
-		sock := filepath.Join(t.TempDir(), "closed.sock")
+		sock := tempSocket(t, "closed.sock")
 		srv, err := NewServer(sock, mock, nil)
 		if err != nil {
 			t.Fatalf("NewServer: %v", err)
@@ -670,5 +796,235 @@ func TestMultipleRequestsOnConnection(t *testing.T) {
 	}
 	if !resp2.OK {
 		t.Fatalf("expected resp2 OK, got error: %s", resp2.Error)
+	}
+}
+
+// syncBuffer collects log output written from the server's connection
+// goroutines while the test goroutine reads it.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
+func TestRequestFraming(t *testing.T) {
+	t.Run("partial line is never dispatched", func(t *testing.T) {
+		// A request without its terminating newline is a fragment. Executing
+		// it would run a command the client never finished sending.
+		mock := &mockService{}
+		_, sock := startTestServer(t, mock)
+
+		conn, err := net.Dial("unix", sock)
+		if err != nil {
+			t.Fatalf("Dial failed: %v", err)
+		}
+		defer conn.Close()
+
+		if _, err := conn.Write([]byte(`{"command":"unban_all"`)); err != nil {
+			t.Fatalf("write failed: %v", err)
+		}
+		// Half-close so the server reads EOF with data still buffered.
+		if err := conn.(*net.UnixConn).CloseWrite(); err != nil {
+			t.Fatalf("CloseWrite failed: %v", err)
+		}
+
+		// The server must close without answering.
+		if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+			t.Fatalf("SetReadDeadline failed: %v", err)
+		}
+		buf := make([]byte, 64)
+		if n, err := conn.Read(buf); err == nil {
+			t.Fatalf("expected EOF, got response %q", buf[:n])
+		}
+
+		mock.mu.Lock()
+		defer mock.mu.Unlock()
+		if len(mock.calls) != 0 {
+			t.Fatalf("partial request was dispatched: %v", mock.calls)
+		}
+	})
+
+	t.Run("oversized request is refused, not buffered", func(t *testing.T) {
+		const limit = 1024
+		mock := &mockService{}
+		_, sock := startTestServer(t, mock, WithMaxRequestBytes(limit))
+
+		conn, err := net.Dial("unix", sock)
+		if err != nil {
+			t.Fatalf("Dial failed: %v", err)
+		}
+		defer conn.Close()
+
+		// No newline anywhere: the old ReadBytes would have grown to whatever
+		// the client cared to send.
+		junk := bytes.Repeat([]byte("x"), 8*limit)
+		go func() { _, _ = conn.Write(junk) }()
+
+		dec := json.NewDecoder(conn)
+		var resp Response
+		if err := dec.Decode(&resp); err != nil {
+			t.Fatalf("decode response failed: %v", err)
+		}
+		if resp.OK {
+			t.Fatal("expected failure for oversized request")
+		}
+		if !strings.Contains(resp.Error, "request too large") {
+			t.Fatalf("error %q does not mention the size limit", resp.Error)
+		}
+	})
+
+	t.Run("idle connection hits the read deadline", func(t *testing.T) {
+		// Exercises the WithTimeouts branches, which had no coverage at all.
+		mock := &mockService{}
+		_, sock := startTestServer(t, mock, WithTimeouts(50*time.Millisecond, 50*time.Millisecond))
+
+		conn, err := net.Dial("unix", sock)
+		if err != nil {
+			t.Fatalf("Dial failed: %v", err)
+		}
+		defer conn.Close()
+
+		if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			t.Fatalf("SetReadDeadline failed: %v", err)
+		}
+		buf := make([]byte, 1)
+		if n, err := conn.Read(buf); err == nil {
+			t.Fatalf("expected the server to drop an idle connection, read %q", buf[:n])
+		}
+	})
+}
+
+func TestMutationAuditLog(t *testing.T) {
+	testIP := netip.MustParseAddr("198.51.100.7")
+
+	tests := []struct {
+		name     string
+		mock     *mockService
+		invoke   func(ctx context.Context, c *Client) error
+		wantErr  bool
+		contains []string
+	}{
+		{
+			name: "ban",
+			mock: &mockService{},
+			invoke: func(ctx context.Context, c *Client) error {
+				return c.Ban(ctx, testIP, "sshd", 30*time.Minute)
+			},
+			contains: []string{"verb=ban", "address=198.51.100.7", "monitor=sshd", "duration=30m0s", "outcome=ok"},
+		},
+		{
+			name: "unban",
+			mock: &mockService{},
+			invoke: func(ctx context.Context, c *Client) error {
+				return c.Unban(ctx, testIP)
+			},
+			contains: []string{"verb=unban", "address=198.51.100.7", "outcome=ok"},
+		},
+		{
+			name: "unban_all",
+			mock: &mockService{},
+			invoke: func(ctx context.Context, c *Client) error {
+				return c.UnbanAll(ctx)
+			},
+			contains: []string{"verb=unban_all", "outcome=ok"},
+		},
+		{
+			name: "reload",
+			mock: &mockService{},
+			invoke: func(ctx context.Context, c *Client) error {
+				return c.Reload(ctx)
+			},
+			contains: []string{"verb=reload", "outcome=ok"},
+		},
+		{
+			name: "rejected ban is audited too",
+			mock: &mockService{banErr: errors.New("ban: address is allowlisted")},
+			invoke: func(ctx context.Context, c *Client) error {
+				return c.Ban(ctx, testIP, "sshd", time.Hour)
+			},
+			wantErr:  true,
+			contains: []string{"verb=ban", "address=198.51.100.7", "outcome=error", "allowlisted"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := &syncBuffer{}
+			logger := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+			sock := tempSocket(t, "audit.sock")
+			srv, err := NewServer(sock, tc.mock, logger)
+			if err != nil {
+				t.Fatalf("NewServer failed: %v", err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			go func() { _ = srv.Run(ctx) }()
+			<-srv.Ready()
+			defer srv.Close()
+			if err := srv.Err(); err != nil {
+				t.Fatalf("bind failed: %v", err)
+			}
+
+			err = tc.invoke(ctx, NewClient(sock))
+			if tc.wantErr && err == nil {
+				t.Fatal("expected the command to fail")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("command failed: %v", err)
+			}
+
+			got := logs.String()
+			for _, want := range tc.contains {
+				if !strings.Contains(got, want) {
+					t.Errorf("audit log missing %q, got:\n%s", want, got)
+				}
+			}
+		})
+	}
+}
+
+func TestStatusResponseJSONRoundTrip(t *testing.T) {
+	// `banhammer status --json` used to emit "uptime": 7200000000000.
+	in := StatusResponse{
+		Uptime:   2 * time.Hour,
+		Monitors: []MonitorStatus{{Name: "sshd", Type: "file", Target: "/var/log/auth.log", TrackedIPs: 3}},
+		Stats:    Stats{LinesRead: 10, TrackedIPs: 3, ActiveBans: 1},
+	}
+
+	data, err := json.Marshal(in)
+	if err != nil {
+		t.Fatalf("Marshal failed: %v", err)
+	}
+	if !strings.Contains(string(data), `"uptime":"2h0m0s"`) {
+		t.Errorf("uptime is not human readable: %s", data)
+	}
+	if !strings.Contains(string(data), `"uptime_seconds":7200`) {
+		t.Errorf("uptime_seconds missing: %s", data)
+	}
+	if !strings.Contains(string(data), `"tracked_ips":3`) || !strings.Contains(string(data), `"active_bans":1`) {
+		t.Errorf("stats gauges missing: %s", data)
+	}
+
+	var out StatusResponse
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatalf("Unmarshal failed: %v", err)
+	}
+	if out.Uptime != in.Uptime {
+		t.Errorf("uptime round trip: got %v, want %v", out.Uptime, in.Uptime)
+	}
+	if out.Stats != in.Stats {
+		t.Errorf("stats round trip: got %+v, want %+v", out.Stats, in.Stats)
 	}
 }

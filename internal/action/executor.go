@@ -35,14 +35,22 @@ type Stats struct {
 // ExecutorOptions tunes an Executor. The zero value is the production
 // configuration; tests use it to shrink timeouts and to inject a sleep.
 //
-// It exists because the contracted NewExecutor takes no configuration, yet the
-// queue size is a config knob and the tests must not sleep for real time.
+// It exists because NewExecutor takes no configuration, and the retry and
+// timeout behaviour must be testable without spending real wall time. Nothing
+// here is reachable from the YAML config: queue_size sizes the daemon's *event*
+// queue, not this one, and the daemon always constructs the executor with the
+// defaults below.
 type ExecutorOptions struct {
 	QueueSize int           // default defaultQueueSize
 	Attempts  int           // total tries per operation; default 3
 	Backoff   time.Duration // first retry delay, doubled each time; default 200ms
-	OpTimeout time.Duration // per-operation deadline; default 30s
-	Drain     time.Duration // how long shutdown may spend on queued work; default 5s
+
+	// OpTimeout bounds one whole operation — every command in a Spec plus the
+	// retries between them — and so is deliberately larger than the 10s
+	// per-command limit PROJECT.md §4.6 places on Spec.Timeout. Default 30s.
+	OpTimeout time.Duration
+
+	Drain time.Duration // how long shutdown may spend on queued work; default 5s
 
 	// Sleep waits for d or until ctx is done, reporting false if it was cut
 	// short. Tests replace it so backoff costs no wall time.

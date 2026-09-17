@@ -6,21 +6,21 @@
 //
 // The daemon implements a multi-stage concurrency pipeline (PROJECT.md §3):
 //
-//   1. Sources: 1 goroutine per input (file tail, socket listener, stdin).
-//      Emits model.Event records into the bounded queue.
-//   2. Queue: A bounded channel with drop-oldest semantics on overflow to ensure
-//      an adversarial log flood never causes unbounded memory consumption.
-//   3. Workers: A pool of stateless goroutines (min(4, GOMAXPROCS)) that decode,
-//      match regex/JSON rules, extract offending IP addresses, and emit matches.
-//   4. Aggregator: Exactly one single-threaded goroutine owning sliding-window
-//      hit trackers per monitor. Free of lock contention by construction.
-//      Triggers ban evaluations when an offender crosses threshold hits.
-//   5. Ban Manager & Action Executor: State machine maintaining the ban table,
-//      escalation policies, allowlists, and an unban min-heap with a single timer,
-//      delegating firewall mutations to a serialized executor with retries.
-//   6. Storage: Durable atomic persistence of bans and read checkpoints.
-//   7. Control & Metrics: Unix domain socket IPC control plane and optional
-//      Prometheus metrics HTTP server.
+//  1. Sources: 1 goroutine per input (file tail, socket listener, stdin).
+//     Emits model.Event records into the bounded queue.
+//  2. Queue: A bounded channel with drop-oldest semantics on overflow to ensure
+//     an adversarial log flood never causes unbounded memory consumption.
+//  3. Workers: A pool of stateless goroutines (min(4, GOMAXPROCS)) that decode,
+//     match regex/JSON rules, extract offending IP addresses, and emit matches.
+//  4. Aggregator: Exactly one single-threaded goroutine owning sliding-window
+//     hit trackers per monitor. Free of lock contention by construction.
+//     Triggers ban evaluations when an offender crosses threshold hits.
+//  5. Ban Manager & Action Executor: State machine maintaining the ban table,
+//     escalation policies, allowlists, and an unban min-heap with a single timer,
+//     delegating firewall mutations to a serialized executor with retries.
+//  6. Storage: Durable atomic persistence of bans and read checkpoints.
+//  7. Control & Metrics: Unix domain socket IPC control plane and optional
+//     Prometheus metrics HTTP server.
 package daemon
 
 import (
@@ -85,22 +85,28 @@ type Daemon struct {
 	sources  []source.Source
 	trackers map[string]*window.Tracker
 
-	queue      chan model.Event
-	matchCh    chan matchEvent
+	queue       chan model.Event
+	matchCh     chan matchEvent
 	sweepReqCh  chan struct{}
 	reloadAggCh chan *config.Config
+
+	// queueMu guards the send on queue against the close in closeQueue.
+	queueMu     sync.RWMutex
+	queueClosed bool
 
 	controlServer *control.Server
 	metricsServer *metrics.Server
 
 	running   atomic.Bool
-	closed    atomic.Bool
 	closeOnce sync.Once
 	reloadMu  sync.Mutex
 
 	aggWg    sync.WaitGroup
 	workerWg sync.WaitGroup
 	srcWg    sync.WaitGroup
+
+	srcStatsMu sync.Mutex
+	srcStats   map[source.Source]uint64
 }
 
 // New constructs and initializes a Daemon instance from the provided configuration.
@@ -123,6 +129,7 @@ func New(cfg *config.Config, opts ...Option) (*Daemon, error) {
 		sweepInterval:  10 * time.Second,
 		sweepReqCh:     make(chan struct{}, 1),
 		reloadAggCh:    make(chan *config.Config, 8),
+		srcStats:       make(map[source.Source]uint64),
 	}
 
 	for _, opt := range opts {
@@ -132,9 +139,8 @@ func New(cfg *config.Config, opts ...Option) (*Daemon, error) {
 	if d.queueSize <= 0 {
 		d.queueSize = 8192
 	}
-	if d.numWorkers <= 0 {
-		d.numWorkers = min(4, max(1, runtime.GOMAXPROCS(0)))
-	}
+	// numWorkers needs no re-defaulting here: the struct literal above seeds it
+	// and WithNumWorkers ignores non-positive values.
 	if !d.controlSocketSet {
 		d.controlSocket = defaultControlSocketPath(cfg.StateDir)
 	}
@@ -177,19 +183,19 @@ func New(cfg *config.Config, opts ...Option) (*Daemon, error) {
 	d.executor = action.NewExecutor(d.backend, d.log)
 
 	// 4. Ban Manager
-	enforcer := &metricsEnforcer{
-		enforcer: d.executor,
-		metrics:  d.metrics,
-	}
 	d.banManager = ban.NewManager(ban.Options{
 		Allowlist:  cfg.Allowlist,
 		AllowLocal: cfg.AllowLocal,
-		Enforcer:   enforcer,
+		Enforcer:   d.executor,
 		Persister:  d.store,
 		Now:        d.now,
 		Log:        d.log,
 		Interfaces: d.interfaces,
 	})
+	// Labelled ban metrics are a projection of the manager's state rather than
+	// a tally of enforcement calls; refresh them whenever they are about to be
+	// read.
+	d.metrics.Collect(d.syncBanMetrics)
 
 	// Set default fallback policy
 	d.banManager.SetPolicy("", ban.Policy{
@@ -288,9 +294,20 @@ func (d *Daemon) cleanupStoreOnFailure() {
 }
 
 // defaultControlSocketPath returns the standard socket location.
+//
+// As root that is /run/banhammer/control.sock, inside the directory the
+// packaged systemd unit creates with RuntimeDirectory=banhammer. It must be a
+// subdirectory, not /run/banhammer.sock: the unit runs with
+// ProtectSystem=strict, under which /run itself is read-only and binding there
+// fails with EROFS — taking the whole control plane (status, ban, unban,
+// reload) down with nothing but a log line to explain it.
+//
+// Unprivileged runs keep their socket in the state directory they already own.
+//
+// cmd/banhammer must agree with this; cli_test.go pins that.
 func defaultControlSocketPath(stateDir string) string {
 	if os.Geteuid() == 0 {
-		return "/run/banhammer.sock"
+		return "/run/banhammer/control.sock"
 	}
 	if stateDir == "" {
 		stateDir = "/var/lib/banhammer"
@@ -307,11 +324,21 @@ func defaultControlSocketPath(stateDir string) string {
 // On cancellation, it conducts a clean shutdown: sources stop, the event queue
 // and workers drain, the aggregator completes remaining matches, offsets are
 // persisted, and all background services terminate cleanly without goroutine leaks.
+//
+// A Daemon is single-use: shutdown closes the internal channels, so Run cannot
+// be called again on the same instance. Build a new one instead.
 func (d *Daemon) Run(ctx context.Context) error {
 	if !d.running.CompareAndSwap(false, true) {
 		return errors.New("daemon: already running")
 	}
 	defer d.running.Store(false)
+
+	d.queueMu.RLock()
+	spent := d.queueClosed
+	d.queueMu.RUnlock()
+	if spent {
+		return errors.New("daemon: already shut down; construct a new Daemon to run again")
+	}
 
 	// 1. Prepare action backend (idempotent chain/table creation)
 	if err := d.backend.Start(ctx); err != nil {
@@ -405,7 +432,7 @@ waitLoop:
 	d.srcWg.Wait()
 
 	// Phase 2: Close event queue and drain workers
-	close(d.queue)
+	d.closeQueue()
 	d.workerWg.Wait()
 
 	// Phase 3: Close match channel and drain aggregator
@@ -445,10 +472,15 @@ waitLoop:
 }
 
 // Close releases daemon resources including the state store and servers.
+//
+// It is safe to call without a preceding Run (New's failure paths do) and safe
+// to call twice; Run calls it as its last shutdown phase.
 func (d *Daemon) Close() error {
 	var err error
 	d.closeOnce.Do(func() {
-		d.closed.Store(true)
+		// Shut the queue so that an Enqueue racing with Close is rejected
+		// rather than panicking on a send to a closed channel.
+		d.closeQueue()
 		if d.controlServer != nil {
 			_ = d.controlServer.Close()
 		}
@@ -465,6 +497,34 @@ func (d *Daemon) Close() error {
 // Metrics returns the in-memory metric registry used across daemon stages.
 func (d *Daemon) Metrics() *metrics.Registry {
 	return d.metrics
+}
+
+// syncBanMetrics copies the ban manager's per-monitor counters and source
+// truncation/discard stats into the registry. It is registered as the
+// registry's collect hook, so a scrape or a status call always reports current
+// numbers without the ban manager or sources having to know that metrics exist.
+func (d *Daemon) syncBanMetrics() {
+	for monitor, s := range d.banManager.StatsByMonitor() {
+		d.metrics.SetBans(monitor, int64(s.Banned))
+		d.metrics.SetUnbans(monitor, int64(s.Unbanned))
+		d.metrics.SetActiveBans(monitor, int64(s.Active))
+	}
+
+	d.srcStatsMu.Lock()
+	defer d.srcStatsMu.Unlock()
+	for _, src := range d.sources {
+		sr, ok := src.(source.StatsReporter)
+		if !ok {
+			continue
+		}
+		st := sr.Stats()
+		total := st.TruncatedLines + st.DiscardedPartialLines
+		prev := d.srcStats[src]
+		if total > prev {
+			d.metrics.AddLinesDropped(src.Name(), int64(total-prev))
+			d.srcStats[src] = total
+		}
+	}
 }
 
 // Service returns an implementation of control.Service suitable for IPC handling.

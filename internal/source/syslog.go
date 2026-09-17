@@ -137,8 +137,14 @@ func cutTimestamp3164(b []byte) ([]byte, bool) {
 		}
 		return rest, true
 	}
-	// ISO-8601 / RFC3339 in a 3164-shaped line: a single field containing a
-	// date, a 'T' and a colon.
+	// Many senders emit an ISO-8601/RFC3339 stamp in an otherwise 3164-shaped
+	// line. The test here is deliberately loose: one space-delimited field, at
+	// least 10 bytes, starting "YYYY-". It does not look for the 'T', the
+	// clock or the zone, because senders vary ("2006-01-02T15:04:05Z",
+	// "2006-01-02 15:04:05" — where the time is a *separate* field — and
+	// fractional or offset suffixes), and because being wrong here is cheap:
+	// the caller falls back to returning the line unchanged, so a header we
+	// misjudge is still matchable, just with its timestamp attached.
 	stamp, rest, ok := cutField(b)
 	if !ok || len(stamp) < 10 || !allDigits(stamp[0:4]) || stamp[4] != '-' {
 		return nil, false

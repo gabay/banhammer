@@ -109,9 +109,14 @@ type tail struct {
 	// Tunables; overridden by tests to keep them fast. useNotify is a test
 	// seam: with it off the tailer only advances when polled or nudged,
 	// which is what makes the rotation tests deterministic instead of racy.
+	// rounds overrides maxPumpRounds, so a test can exercise exhaustion
+	// without staging 32 rotations.
 	poll      time.Duration
 	rescan    time.Duration
 	useNotify bool
+	rounds    int
+
+	stats sourceStats
 
 	mu      sync.Mutex
 	files   map[string]*fileTailer
@@ -122,7 +127,9 @@ type tail struct {
 func (t *tail) Name() string { return t.monitor }
 
 // Checkpoints returns one checkpoint per tailed file, positioned at the last
-// complete line handed to the pipeline.
+// complete line handed to the pipeline. A checkpoint outlives the tailer that
+// produced it (see scan), so a file that leaves and rejoins a glob is not
+// re-read.
 func (t *tail) Checkpoints() []model.Checkpoint {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -136,6 +143,38 @@ func (t *tail) Checkpoints() []model.Checkpoint {
 	// Stable order keeps the persisted file diff-friendly.
 	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
 	return out
+}
+
+// Stats reports over-long lines truncated and unterminated fragments dropped
+// at rotation, summed over every file this source tails.
+func (t *tail) Stats() Stats { return t.stats.snapshot() }
+
+// checkpoint resolves the saved read position for path: this run's own
+// in-memory checkpoint first, then the persisted store.
+//
+// Ours wins because it is newer and because it is the only one that exists for
+// a glob member retired and rediscovered mid-run — without it a glob that
+// flaps (a file briefly renamed, a mount blipping) re-reads lines it already
+// emitted, and re-emitted lines are re-counted hits.
+func (t *tail) checkpoint(path string) (model.Checkpoint, bool) {
+	t.mu.Lock()
+	cp, ok := t.saved[path]
+	t.mu.Unlock()
+	if ok {
+		return cp, true
+	}
+	if t.lookup == nil {
+		return model.Checkpoint{}, false
+	}
+	return t.lookup.Lookup(path)
+}
+
+// roundLimit is maxPumpRounds unless a test lowered it.
+func (t *tail) roundLimit() int {
+	if t.rounds > 0 {
+		return t.rounds
+	}
+	return maxPumpRounds
 }
 
 func (t *tail) Run(ctx context.Context, out chan<- model.Event) error {
@@ -176,7 +215,7 @@ func (t *tail) Run(ctx context.Context, out chan<- model.Event) error {
 		}()
 	}
 
-	t.scan(ctx, out, &wg, true)
+	t.scan(ctx, out, &wg)
 
 	var rescanC <-chan time.Time
 	if t.isGlob {
@@ -191,11 +230,11 @@ loop:
 		case <-ctx.Done():
 			break loop
 		case <-rescanC:
-			t.scan(ctx, out, &wg, false)
+			t.scan(ctx, out, &wg)
 		case <-rescan:
 			// A create/rename in a watched directory may be a new glob match
 			// (or the recreation of a missing file).
-			t.scan(ctx, out, &wg, false)
+			t.scan(ctx, out, &wg)
 		}
 	}
 
@@ -282,7 +321,23 @@ func (t *tail) wakeAll() {
 // scan resolves the pattern and starts a tailer for every path that does not
 // have one yet. Existing tailers keep their offsets, so a rescan never
 // re-reads a file from the start.
-func (t *tail) scan(ctx context.Context, out chan<- model.Event, wg *sync.WaitGroup, initial bool) {
+//
+// A file found by a rescan is treated exactly like one found at startup: it
+// gets the monitor's start_at, and under the default (checkpoint) that means
+// the store — or this run's own checkpoint — decides, falling back to the end
+// of the file. Reading rescan discoveries from byte 0, as this used to, is
+// wrong in the cases that actually happen: a new vhost log, a rotated archive
+// copied into the directory, or an operator restoring a backup all match the
+// glob with a full history behind them, get replayed in one burst and trip
+// every threshold at once. PROJECT.md §4.1 is explicit that not replaying
+// history is the point of start_at.
+//
+// The cost is the other direction: a genuinely new file that the writer has
+// been filling for up to one rescan interval starts at its end, so those lines
+// are missed. That is bounded (ten seconds of one file) and silent, where the
+// replay bug is unbounded and bans real users. Set start_at: beginning if a
+// monitor prefers the other trade.
+func (t *tail) scan(ctx context.Context, out chan<- model.Event, wg *sync.WaitGroup) {
 	paths := t.matches()
 
 	t.mu.Lock()
@@ -291,15 +346,8 @@ func (t *tail) scan(ctx context.Context, out chan<- model.Event, wg *sync.WaitGr
 		if _, ok := t.files[p]; ok {
 			continue
 		}
-		// Files discovered after startup are new files, so they are read from
-		// the beginning regardless of start_at; start_at is about not
-		// replaying history we have already seen.
-		start := t.startAt
-		if !initial {
-			start = startAtBeginning
-		}
 		fctx, fcancel := context.WithCancel(ctx)
-		ft := newFileTailer(t, p, start, fcancel)
+		ft := newFileTailer(t, p, t.startAt, fcancel)
 		t.files[p] = ft
 		wg.Add(1)
 		go func() {
@@ -325,8 +373,32 @@ func (t *tail) scan(ctx context.Context, out chan<- model.Event, wg *sync.WaitGr
 		}
 		ft.cancel()
 		delete(t.files, p)
-		delete(t.saved, p)
+		// t.saved[p] deliberately survives: the path may come back (a glob
+		// member that flaps, a file restored from backup) and re-reading
+		// what we already emitted would re-count every hit in it. A stale
+		// entry costs a line of JSON, and the inode check in startOffset
+		// discards it if the file that returns is a different one.
+		t.removeWatchLocked(p)
 		t.log.Debug("retiring tailer for vanished file", "path", p)
+	}
+}
+
+// removeWatchLocked drops the watch on a retired path. t.mu must be held.
+//
+// inotify usually does this for us (a deleted inode's watch is removed with an
+// IN_IGNORED event), but not always: a file that left the glob by being
+// renamed keeps its watch alive against the old inode, and a glob whose
+// members churn would then leak one watch per file until the process hits
+// fs.inotify.max_user_watches. Removing it explicitly costs a syscall per
+// retirement.
+func (t *tail) removeWatchLocked(path string) {
+	if t.watcher == nil {
+		return
+	}
+	if err := t.watcher.Remove(path); err != nil {
+		// Almost always "watch does not exist" because inotify already
+		// cleaned up; not worth more than a debug line.
+		t.log.Debug("removing watch for retired file", "path", path, "err", err)
 	}
 }
 
@@ -336,8 +408,11 @@ func (t *tail) matches() []string {
 	}
 	paths, err := filepath.Glob(t.pattern)
 	if err != nil {
-		// Only ErrBadPattern, which NewTail already rejected.
-		t.log.Warn("glob failed", "err", err)
+		// Unreachable: Glob's only error is ErrBadPattern and NewTail
+		// rejected those at construction. Handled rather than ignored so
+		// that a future change to either end shows up as a log line instead
+		// of a monitor that silently watches nothing.
+		t.log.Warn("glob failed, monitoring no files this scan", "err", err)
 		return nil
 	}
 	out := paths[:0]
@@ -377,6 +452,9 @@ type fileTailer struct {
 	em     emitter
 
 	warnedMissing bool
+	// errWarn bounds the read-error warning the way warnedMissing bounds the
+	// missing-file one.
+	errWarn rateLimiter
 }
 
 func newFileTailer(t *tail, path, startAt string, cancel context.CancelFunc) *fileTailer {
@@ -414,7 +492,13 @@ func (ft *fileTailer) run(ctx context.Context, out chan<- model.Event) {
 			}
 			// A transient read error (EIO, a disappearing mount) must not
 			// kill the monitor; retry on the next tick.
-			ft.log.Warn("tail error, retrying", "err", err)
+			//
+			// Most of these are not transient though — EACCES on a log we
+			// are not allowed to read is the common one — and the retry is
+			// per poll tick, so an unrate-limited warning here is a line a
+			// second, per file, forever. Warn like the missing-file case
+			// does: once, then only occasionally (PROJECT.md §4.9).
+			ft.errWarn.warn(ft.log, "tail error, retrying", "err", err)
 		}
 		select {
 		case <-ctx.Done():
@@ -429,7 +513,7 @@ func (ft *fileTailer) run(ctx context.Context, out chan<- model.Event) {
 // truncation, looping so that a rotate discovered at EOF is followed
 // immediately by reading the replacement file.
 func (ft *fileTailer) pump(ctx context.Context) error {
-	for round := 0; round < maxPumpRounds; round++ {
+	for round := 0; round < ft.t.roundLimit(); round++ {
 		if ft.f == nil {
 			opened, err := ft.open()
 			if err != nil {
@@ -450,41 +534,75 @@ func (ft *fileTailer) pump(ctx context.Context) error {
 		case stateUnchanged:
 			return nil
 		case stateTruncated:
-			ft.log.Info("log truncated, rewinding", "was_offset", ft.offset)
-			if _, err := ft.f.Seek(0, io.SeekStart); err != nil {
-				return fmt.Errorf("seek %s: %w", ft.path, err)
+			if err := ft.handleTruncation(); err != nil {
+				return err
 			}
-			ft.offset = 0
-			// Whatever partial line we held belonged to the discarded
-			// content; it can never be completed.
-			ft.sp.reset()
-			ft.publish()
 		case stateRotated:
-			// Drain the old descriptor before switching. Between our last
-			// EOF and the rename the writer may have flushed more lines,
-			// and dropped lines are dropped attacks.
-			if err := ft.readAvailable(ctx); err != nil {
+			if err := ft.handleRotation(ctx); err != nil {
 				return err
 			}
-			if n := ft.sp.pending(); n > 0 {
-				ft.log.Debug("discarding unterminated trailing line from rotated file", "bytes", n)
-			}
-			ft.log.Info("log rotated, reopening")
-			ft.closeFile()
 		case stateDeleted:
-			// Truly unlinked, not renamed: drain what is left and let the
-			// descriptor go. Holding it would pin the disk space and keep a
-			// goroutine alive for a file that can never come back.
-			if err := ft.readAvailable(ctx); err != nil {
-				return err
-			}
-			ft.log.Info("log file was deleted, releasing it")
-			ft.closeFile()
-			return nil
+			return ft.handleDeletion(ctx)
 		}
 	}
 	// Out of rounds: come back on the next wakeup rather than spinning.
 	ft.nudge()
+	return nil
+}
+
+// handleTruncation rewinds to the start of the same inode, which is what
+// `cp /dev/null app.log` and `logrotate copytruncate` leave behind.
+func (ft *fileTailer) handleTruncation() error {
+	ft.log.Info("log truncated, rewinding", "was_offset", ft.offset)
+	if _, err := ft.f.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("seek %s: %w", ft.path, err)
+	}
+	ft.offset = 0
+	// Whatever partial line we held belonged to the discarded content; it can
+	// never be completed.
+	ft.sp.reset()
+	ft.publish()
+	return nil
+}
+
+// handleRotation drains the renamed descriptor and releases it, so the next
+// round opens the replacement file.
+func (ft *fileTailer) handleRotation(ctx context.Context) error {
+	// Between our last EOF and the rename the writer may have flushed more
+	// lines, and dropped lines are dropped attacks.
+	if err := ft.readAvailable(ctx); err != nil {
+		return err
+	}
+	if n := ft.sp.pending(); n > 0 {
+		// Still discarded, on purpose: the writer is alive and will finish
+		// this line in the *new* file, so emitting the fragment here would
+		// double-count it and hand the matcher half a line. But it is a line
+		// of log we are throwing away, so it is counted rather than
+		// whispered at Debug.
+		ft.t.stats.noteDiscarded(ft.log, 1, n)
+	}
+	ft.log.Info("log rotated, reopening")
+	ft.closeFile()
+	return nil
+}
+
+// handleDeletion releases a descriptor whose inode has been unlinked. Holding
+// it would pin the disk space and keep a goroutine alive for a file that can
+// never come back.
+func (ft *fileTailer) handleDeletion(ctx context.Context) error {
+	if err := ft.readAvailable(ctx); err != nil {
+		return err
+	}
+	// Unlike rotation, EOF here is authoritative: the inode has no links left,
+	// so no writer can ever terminate this line. Emitting it is the only way
+	// the last thing written before `rm` reaches the pipeline — and the last
+	// line before a log is deleted is exactly the interesting one.
+	if err := ft.sp.flush(func(line []byte) error { return ft.em.emit(ctx, line) }); err != nil {
+		return err
+	}
+	ft.publish()
+	ft.log.Info("log file was deleted, releasing it")
+	ft.closeFile()
 	return nil
 }
 
@@ -531,6 +649,7 @@ func (ft *fileTailer) open() (bool, error) {
 	return true, nil
 }
 
+// startOffset decides where in the file reading begins, per start_at.
 func (ft *fileTailer) startOffset(fi os.FileInfo, id fileID) int64 {
 	switch ft.startAt {
 	case startAtBeginning:
@@ -539,10 +658,7 @@ func (ft *fileTailer) startOffset(fi os.FileInfo, id fileID) int64 {
 		return fi.Size()
 	}
 	// checkpoint
-	if ft.t.lookup == nil {
-		return fi.Size()
-	}
-	cp, ok := ft.t.lookup.Lookup(ft.path)
+	cp, ok := ft.t.checkpoint(ft.path)
 	if !ok {
 		ft.log.Debug("no checkpoint for file, starting at end")
 		return fi.Size()
@@ -566,7 +682,12 @@ func (ft *fileTailer) startOffset(fi os.FileInfo, id fileID) int64 {
 	return cp.Offset
 }
 
+// readAvailable drains the descriptor up to EOF, emitting complete lines.
 func (ft *fileTailer) readAvailable(ctx context.Context) error {
+	// A tailer reaches EOF on every wakeup and never a final one, so there is
+	// no "we are done" moment at which to report truncations: bank them on
+	// the way out of every read instead.
+	defer ft.t.stats.noteSplitter(ft.log, &ft.sp)
 	emit := func(line []byte) error { return ft.em.emit(ctx, line) }
 	for {
 		n, err := ft.f.Read(ft.rbuf)

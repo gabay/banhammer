@@ -131,14 +131,54 @@ func equalStrings(a, b []string) bool {
 	return true
 }
 
-// assertNoLeak compares the goroutine count before and after, retrying because
-// runtime bookkeeping (and fsnotify's own teardown) lags by a few scheduler
-// ticks.
+// waitFor polls cond until it holds, failing with what after waitTimeout.
+//
+// Tests use it instead of sleeping "long enough": a sleep tuned on a quiet
+// laptop is both slower than it needs to be and flaky on a loaded CI machine,
+// and it encodes an assumption about timing rather than about behaviour.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(waitTimeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
+// sourceGoroutines counts the goroutines that belong to this package: ones
+// whose stack mentions a source frame, plus fsnotify's, which our tailers
+// start and stop.
+//
+// runtime.NumGoroutine() is process-global, so comparing it before and after
+// makes a leak assertion fail whenever anything else in the binary happens to
+// be running — the testing package's own bookkeeping, a lingering http
+// transport, or (mostly) a neighbouring t.Parallel test. Leak tests here do
+// not call t.Parallel either; the filter is belt and braces, because a false
+// "goroutine leak" failure is the kind of flake that gets a test deleted
+// rather than fixed.
+func sourceGoroutines() int {
+	buf := make([]byte, 1<<20)
+	buf = buf[:runtime.Stack(buf, true)]
+	n := 0
+	for _, stack := range strings.Split(string(buf), "\n\n") {
+		if strings.Contains(stack, "banhammer/internal/source") || strings.Contains(stack, "fsnotify") {
+			n++
+		}
+	}
+	return n
+}
+
+// assertNoLeak compares the package's goroutine count before and after,
+// retrying because runtime bookkeeping (and fsnotify's own teardown) lags by a
+// few scheduler ticks.
 func assertNoLeak(t *testing.T, before int) {
 	t.Helper()
 	var after int
 	for range 100 {
-		after = runtime.NumGoroutine()
+		after = sourceGoroutines()
 		if after <= before {
 			return
 		}
@@ -146,5 +186,5 @@ func assertNoLeak(t *testing.T, before int) {
 	}
 	buf := make([]byte, 1<<16)
 	buf = buf[:runtime.Stack(buf, true)]
-	t.Errorf("goroutine leak: %d before, %d after\n%s", before, after, buf)
+	t.Errorf("goroutine leak: %d source goroutines before, %d after\n%s", before, after, buf)
 }

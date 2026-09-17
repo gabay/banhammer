@@ -142,7 +142,7 @@ func TestKnownKeysMatchStructTags(t *testing.T) {
 			"strip_syslog", "threshold", "window",
 		},
 		"config.rawMetrics": {"listen"},
-		"config.rawAction":  {"ban", "name", "shell", "start", "stop", "timeout", "unban"},
+		"config.rawAction":  {"ban", "chain", "name", "shell", "start", "stop", "timeout", "unban"},
 	}
 
 	got := keyIndex()
@@ -171,6 +171,7 @@ func TestActionSwitchHandlesEveryKey(t *testing.T) {
 
 	values := map[string]string{
 		"name":    "cmd",
+		"chain":   "DOCKER-USER",
 		"start":   "s",
 		"ban":     "b",
 		"unban":   "u",
@@ -188,10 +189,10 @@ func TestActionSwitchHandlesEveryKey(t *testing.T) {
 			t.Fatalf("action key %q has no test value: was a key added without updating the switch?", k)
 		}
 		src := "monitors:\n  m:\n    stdin: true\n    match: \"<IP>\"\n    action:\n      " + k + ": " + v + "\n"
-		_, errs := decode([]byte(src))
-		for _, err := range errs {
-			if strings.Contains(err.Error(), "unknown key") {
-				t.Errorf("action key %q rejected: %v", k, err)
+		_, problems := decode([]byte(src))
+		for _, p := range problems {
+			if strings.Contains(p.err.Error(), "unknown key") {
+				t.Errorf("action key %q rejected: %v", k, p.err)
 			}
 		}
 	}
@@ -203,7 +204,7 @@ func TestActionSwitchHandlesEveryKey(t *testing.T) {
 	}
 	c := mustParse(t, src)
 	a := c.Monitors["m"].Action
-	if a.Name != "cmd" || a.Start != "s" || a.Ban != "b" || a.Unban != "u" || a.Stop != "p" || !a.Shell || a.Timeout.String() != "5s" {
+	if a.Name != "cmd" || a.Chain != "DOCKER-USER" || a.Start != "s" || a.Ban != "b" || a.Unban != "u" || a.Stop != "p" || !a.Shell || a.Timeout.String() != "5s" {
 		t.Errorf("action = %+v", a)
 	}
 }
@@ -220,12 +221,17 @@ func TestActionShapes(t *testing.T) {
 		{
 			name: "scalar name",
 			src:  "action: ipset\n",
-			want: ActionSpec{Name: "ipset", Timeout: defaultActionTimeout},
+			want: ActionSpec{Name: "ipset", Chain: defaultActionChain, Timeout: defaultActionTimeout},
+		},
+		{
+			name: "chain override on default backend",
+			src:  "action:\n      chain: DOCKER-USER\n",
+			want: ActionSpec{Name: "iptables", Chain: "DOCKER-USER", Timeout: defaultActionTimeout},
 		},
 		{
 			name: "templates imply cmd",
 			src:  "action:\n      ban: \"block {ip}\"\n      unban: \"unblock {ip}\"\n",
-			want: ActionSpec{Name: "cmd", Ban: "block {ip}", Unban: "unblock {ip}", Timeout: defaultActionTimeout},
+			want: ActionSpec{Name: "cmd", Chain: defaultActionChain, Ban: "block {ip}", Unban: "unblock {ip}", Timeout: defaultActionTimeout},
 		},
 		{
 			name: "ban without unban",
@@ -251,6 +257,26 @@ func TestActionShapes(t *testing.T) {
 			name: "unknown backend",
 			src:  "action: iptable\n",
 			err:  `action "iptable" is not one of iptables, ipset, nft, dryrun, cmd`,
+		},
+		{
+			name: "empty chain",
+			src:  "action:\n      name: iptables\n      chain: \"\"\n",
+			err:  "action chain cannot be empty",
+		},
+		{
+			name: "invalid chain characters",
+			src:  "action:\n      name: iptables\n      chain: \"BAD CHAIN!\"\n",
+			err:  `action chain "BAD CHAIN!" must be 1..28 letters, digits, underscores or hyphens`,
+		},
+		{
+			name: "nft with iptables chain gives helpful hint",
+			src:  "action:\n      name: nft\n      chain: DOCKER-USER\n",
+			err:  `action "nft" attaches to a netfilter hook (input, forward, output, prerouting, postrouting), not an iptables chain like "DOCKER-USER"; use action "iptables" or "ipset" to attach to "DOCKER-USER"`,
+		},
+		{
+			name: "nft with valid hook",
+			src:  "action:\n      name: nft\n      chain: FORWARD\n",
+			want: ActionSpec{Name: "nft", Chain: "FORWARD", Timeout: defaultActionTimeout},
 		},
 		{
 			name: "zero timeout",
@@ -345,11 +371,15 @@ func TestLevenshtein(t *testing.T) {
 }
 
 // TestHumanizePassesThroughUnknownShapes keeps yaml's own diagnostics intact
-// when they are not the "field not found" form.
+// when they are not the "field not found" form, and pins the valuesLost tag
+// that decides whether the block around a problem is still validated.
 func TestHumanizePassesThroughUnknownShapes(t *testing.T) {
 	t.Parallel()
 
-	tests := []struct{ in, want string }{
+	tests := []struct {
+		in, want string
+		lost     bool
+	}{
 		{
 			in:   "line 3: field treshold not found in type config.rawMonitor",
 			want: `line 3: unknown key "treshold" in a monitor (did you mean "threshold"?)`,
@@ -357,32 +387,53 @@ func TestHumanizePassesThroughUnknownShapes(t *testing.T) {
 		{
 			in:   "line 3: field x not found in type some.OtherType",
 			want: "line 3: field x not found in type some.OtherType",
+			lost: true,
 		},
 		{
 			in:   "line 7: cannot unmarshal !!str `abc` into int",
 			want: "line 7: expected a whole number, got a string (abc)",
+			lost: true,
 		},
 		{
 			in:   "line 2: cannot unmarshal !!str `hello` into config.rawMonitor",
 			want: "line 2: a monitor must be a block of indented keys, got a string (hello)",
+			lost: true,
 		},
 		{
 			in:   "line 1: cannot unmarshal !!seq into map[string]*config.rawMonitor",
 			want: "line 1: monitors must be a block of named monitors, got a list",
+			lost: true,
+		},
+		{
+			// yaml's duplicate-key jargon must not reach the user.
+			in:   `line 5: mapping key "sshd" already defined at line 3`,
+			want: `line 5: key "sshd" is already set at line 3; remove one of them (while it is ambiguous the whole block is dropped)`,
+			lost: true,
 		},
 		{
 			// An unfamiliar target type must not be guessed at.
 			in:   "line 4: cannot unmarshal !!str `x` into chan int",
 			want: "line 4: cannot unmarshal !!str `x` into chan int",
+			lost: true,
 		},
 		{
 			in:   "line 9: something yaml has not said before",
 			want: "line 9: something yaml has not said before",
+			lost: true,
+		},
+		{
+			// A message one of this package's own unmarshalers marked.
+			in:   keptValues(`line 7: unknown key "unbam" in an action (did you mean "unban"?)`),
+			want: `line 7: unknown key "unbam" in an action (did you mean "unban"?)`,
 		},
 	}
 	for _, tc := range tests {
-		if got := humanize(tc.in); got != tc.want {
+		got, lost := humanize(tc.in)
+		if got != tc.want {
 			t.Errorf("humanize(%q) =\n  %q\nwant\n  %q", tc.in, got, tc.want)
+		}
+		if lost != tc.lost {
+			t.Errorf("humanize(%q) valuesLost = %t, want %t", tc.in, lost, tc.lost)
 		}
 	}
 }

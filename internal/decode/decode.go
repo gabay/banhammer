@@ -536,42 +536,54 @@ func (w *walker) digits() int {
 
 // unescape decodes the string content in raw[s:e] into the scratch buffer and
 // returns its bounds there.
+//
+// parseString has already validated every escape, so the malformed cases below
+// cannot happen today. They are handled anyway, and the loop is written so
+// that i advances before any branch decides anything: the previous shape only
+// advanced inside its switch cases, so a future caller handing this function
+// unvalidated bytes would have spun forever on, say, a lone "\q". A hang is
+// the one failure mode fuzzing cannot see, so it is worth making structurally
+// impossible rather than merely unreachable.
 func (w *walker) unescape(s, e int) (int, int) {
 	start := len(w.scratch)
 	for i := s; i < e; {
 		c := w.raw[i]
+		i++
 		if c != '\\' {
 			w.scratch = append(w.scratch, c)
-			i++
 			continue
 		}
+		if i >= e {
+			// Trailing backslash with nothing after it: keep it literally.
+			w.scratch = append(w.scratch, '\\')
+			continue
+		}
+		esc := w.raw[i]
 		i++
-		switch w.raw[i] {
+		switch esc {
 		case '"', '\\', '/':
-			w.scratch = append(w.scratch, w.raw[i])
-			i++
+			w.scratch = append(w.scratch, esc)
 		case 'b':
 			w.scratch = append(w.scratch, '\b')
-			i++
 		case 'f':
 			w.scratch = append(w.scratch, '\f')
-			i++
 		case 'n':
 			w.scratch = append(w.scratch, '\n')
-			i++
 		case 'r':
 			w.scratch = append(w.scratch, '\r')
-			i++
 		case 't':
 			w.scratch = append(w.scratch, '\t')
-			i++
 		case 'u':
-			r := rune(hex4(w.raw[i+1 : i+5]))
-			i += 5
+			if i+4 > e {
+				// Truncated \u: emit what is there literally.
+				w.scratch = append(w.scratch, '\\', 'u')
+				continue
+			}
+			r := rune(hex4(w.raw[i : i+4]))
+			i += 4
 			// A high surrogate is only meaningful paired with the low one
 			// that follows it; anything else becomes U+FFFD, as
-			// encoding/json does. parseString already guaranteed that any
-			// \u here is followed by four hex digits.
+			// encoding/json does.
 			if utf16.IsSurrogate(r) {
 				r = utf8.RuneError
 				if i+6 <= e && w.raw[i] == '\\' && w.raw[i+1] == 'u' {
@@ -584,11 +596,18 @@ func (w *walker) unescape(s, e int) (int, int) {
 			var buf [4]byte
 			n := utf8.EncodeRune(buf[:], r)
 			w.scratch = append(w.scratch, buf[:n]...)
+		default:
+			// Not a JSON escape at all. Keep the byte rather than drop it
+			// silently — and note that i has already moved past it, so this
+			// branch, like every other, terminates.
+			w.scratch = append(w.scratch, esc)
 		}
 	}
 	return start, len(w.scratch)
 }
 
+// hex4 decodes four hex digits. Callers must have validated them (see
+// isHex4); an invalid digit yields a garbage value, never a panic.
 func hex4(b []byte) uint32 {
 	var v uint32
 	for _, c := range b {

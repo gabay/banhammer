@@ -76,10 +76,14 @@ func atomicWrite(dir, base string, data []byte, write func(*os.File, []byte) err
 	}
 	if err = fsyncDir(dir); err != nil {
 		// The rename already happened, so the new contents are visible but
-		// possibly not durable. The deferred cleanup still runs and still
-		// tries to remove the temp name; that is harmless, because the name
-		// is gone and a not-exist removal is tolerated above.
-		err = fmt.Errorf("durability of %s: %w", target, err)
+		// possibly not durable. That is a weaker failure than "the data never
+		// reached the file", so it is tagged ErrNotDurable: a caller that
+		// treated it as ErrNotPersisted would refuse to hand over a state
+		// directory whose contents are in fact correct. The deferred cleanup
+		// still runs and still tries to remove the temp name; that is
+		// harmless, because the name is gone and a not-exist removal is
+		// tolerated above.
+		err = fmt.Errorf("durability of %s: %w: %w", target, ErrNotDurable, err)
 		return err
 	}
 

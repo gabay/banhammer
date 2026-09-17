@@ -146,6 +146,18 @@ func TestValidateMonitorRules(t *testing.T) {
 			err:  `ip_field and an <IP> group in match "from <IP>" are mutually exclusive`,
 		},
 		{
+			// <HOST> captures an address too, so it clashes just the same.
+			name: "ip_field and HOST macro conflict",
+			src:  "    file: /a\n    format: json\n    ip_field: remote_ip\n    match: \"from <HOST>\"\n",
+			err:  `ip_field and an <IP> group in match "from <HOST>" are mutually exclusive`,
+		},
+		{
+			// So does a hand-written group, which is the spelling rule uses.
+			name: "ip_field and a named group conflict",
+			src:  "    file: /a\n    format: json\n    ip_field: remote_ip\n    match: \"from (?P<ip>[0-9.]+)\"\n",
+			err:  `ip_field and an <IP> group in match "from (?P<ip>[0-9.]+)" are mutually exclusive`,
+		},
+		{
 			name: "unknown format",
 			src:  "    file: /a\n    format: logfmt\n    match: \"<IP>\"\n",
 			err:  `format must be one of text, json, got "logfmt"`,
@@ -173,13 +185,38 @@ func TestValidateMonitorRules(t *testing.T) {
 func TestValidateMonitorName(t *testing.T) {
 	t.Parallel()
 
-	assertError(t,
-		"monitors:\n  \"ssh d!\":\n    file: /a\n    match: \"<IP>\"\n",
-		`monitor "ssh d!": invalid name: use letters, digits, '.', '-' and '_' only`)
+	const badName = "invalid name: use letters, digits, '.', '-' and '_', starting with a letter, digit or '_'"
+	tests := []struct {
+		name string
+		ok   bool
+	}{
+		{name: "sshd", ok: true},
+		{name: "nginx-auth", ok: true},
+		{name: "app.v2", ok: true},
+		{name: "a_b", ok: true},
+		{name: "m1", ok: true},
+		// Names that are used verbatim in {monitor} substitutions must stay
+		// boring, and the first character is where "boring" is easiest to
+		// lose: a leading '.' hides the state file and a leading '-' reads as
+		// a flag. A leading '_' does neither, and the message has always
+		// promised underscores work.
+		{name: "_internal", ok: true},
+		{name: "-dashed"},
+		{name: ".hidden"},
+		{name: "ssh d!"},
+	}
 
-	// Names that are used verbatim in {monitor} substitutions must stay boring.
-	for _, ok := range []string{"sshd", "nginx-auth", "app.v2", "a_b", "m1"} {
-		mustParse(t, "monitors:\n  "+ok+":\n    stdin: true\n    match: \"<IP>\"\n")
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			src := "monitors:\n  \"" + tc.name + "\":\n    stdin: true\n    match: \"<IP>\"\n"
+			if tc.ok {
+				mustParse(t, src)
+				return
+			}
+			assertError(t, src, "monitor \""+tc.name+"\": "+badName)
+		})
 	}
 }
 
@@ -249,6 +286,13 @@ func TestGlobalValidation(t *testing.T) {
 	tests := []struct{ name, src, err string }{
 		{name: "log_format", src: "log_format: xml\n" + monitor, err: `log_format must be one of text, json, got "xml"`},
 		{name: "queue_size", src: "queue_size: 0\n" + monitor, err: "queue_size must be at least 1, got 0"},
+		{
+			// An unbounded queue_size passes `check` and then dies allocating
+			// the channel, which is the one failure §6 promises cannot happen.
+			name: "queue_size cap",
+			src:  "queue_size: 1000000000\n" + monitor,
+			err:  "queue_size must be at most 1048576, got 1000000000: the queue is allocated in full at startup",
+		},
 		{name: "state_dir", src: "state_dir: \"\"\n" + monitor, err: "state_dir must not be empty"},
 		{name: "metrics listen", src: "metrics:\n  listen: 9777\n" + monitor, err: `metrics.listen: "9777" must be host:port`},
 		{name: "metrics port", src: "metrics:\n  listen: 127.0.0.1:0\n" + monitor, err: `has an invalid port "0"`},
@@ -261,10 +305,83 @@ func TestGlobalValidation(t *testing.T) {
 		})
 	}
 
+	// The cap itself is allowed; only what is past it is not.
+	if c := mustParse(t, "queue_size: 1048576\n"+monitor); c.QueueSize != maxQueueSize {
+		t.Errorf("QueueSize = %d, want %d", c.QueueSize, maxQueueSize)
+	}
+
 	// A valid metrics endpoint survives.
 	c := mustParse(t, "metrics:\n  listen: 127.0.0.1:9777\n"+monitor)
 	if c.Metrics.Listen != "127.0.0.1:9777" {
 		t.Errorf("Metrics.Listen = %q", c.Metrics.Listen)
+	}
+}
+
+// TestDuplicateListenAddress covers two monitors claiming one address. Without
+// this the clash surfaces as a failed bind at startup, long after the config
+// was declared good.
+func TestDuplicateListenAddress(t *testing.T) {
+	t.Parallel()
+
+	const src = `
+monitors:
+  a:
+    listen: udp://0.0.0.0:5140
+    match: "<IP>"
+  b:
+    listen: udp://0.0.0.0:5140
+    match: "<IP>"
+  c:
+    listen: tcp://0.0.0.0:5140
+    match: "<IP>"
+`
+	err := parseErr(t, src)
+	wantContains(t, err.Error(), `monitors "a", "b" all listen on "udp://0.0.0.0:5140", but only one of them can bind it`)
+	// A different scheme on the same port is a different socket.
+	if strings.Contains(err.Error(), "tcp://") {
+		t.Errorf("tcp and udp on one port were treated as a clash:\n%v", err)
+	}
+
+	// The same address in one monitor is, of course, fine.
+	mustParse(t, "monitors:\n  a:\n    listen: udp://0.0.0.0:5140\n    match: \"<IP>\"\n")
+}
+
+// TestBlankSourceValues covers the written-but-empty source key. `file: ""` and
+// `file: "   "` are the same half-finished edit and must read the same way;
+// `file: ""` used to be reported as a missing source instead.
+func TestBlankSourceValues(t *testing.T) {
+	t.Parallel()
+
+	for _, value := range []string{`""`, `"   "`} {
+		src := "monitors:\n  m:\n    file: " + value + "\n    match: \"<IP>\"\n"
+		err := parseErr(t, src)
+		wantContains(t, err.Error(), `monitor "m": file is blank: give a path or a glob`)
+		if strings.Contains(err.Error(), "no source") {
+			t.Errorf("file: %s was reported as a missing source:\n%v", value, err)
+		}
+	}
+}
+
+// TestContainsPrefilter covers the `contains:` override, whose only failure
+// mode is being silently ignored.
+func TestContainsPrefilter(t *testing.T) {
+	t.Parallel()
+
+	const head = "monitors:\n  m:\n    file: /a\n    match: \"from <IP>\"\n"
+
+	assertError(t, head+"    contains: \"\"\n",
+		`monitor "m": contains is empty: give a literal substring to require, or drop the key`)
+
+	// A literal, including one made only of spaces, is a real prefilter.
+	for _, value := range []string{`"sshd"`, `"   "`} {
+		c := mustParse(t, head+"    contains: "+value+"\n")
+		if got := c.Monitors["m"].Contains; got == "" {
+			t.Errorf("contains: %s was dropped", value)
+		}
+	}
+	// An absent key is not an empty one.
+	if got := mustParse(t, head).Monitors["m"].Contains; got != "" {
+		t.Errorf("Contains = %q, want empty when the key is absent", got)
 	}
 }
 

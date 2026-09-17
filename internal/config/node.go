@@ -6,12 +6,48 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// nullTag is the resolved tag yaml.v3 gives an empty scalar ("key:" with no
-// value). It is worth distinguishing: an omitted value is "unset", not "".
-const nullTag = "!!null"
+// The resolved YAML tags this package reasons about. nullTag is the one that
+// carries meaning of its own: an empty scalar ("key:" with no value) is
+// "unset", not "".
+const (
+	nullTag  = "!!null"
+	strTag   = "!!str"
+	intTag   = "!!int"
+	floatTag = "!!float"
+	boolTag  = "!!bool"
+	seqTag   = "!!seq"
+	mapTag   = "!!map"
+)
+
+// tagShapes translates a YAML tag into the words this package's diagnostics
+// use. describeNode (for nodes it walks itself) and wrongShapeMsg (for the
+// tags yaml quotes back in its own messages) both read it, so the two can only
+// ever say the same thing about the same value.
+var tagShapes = map[string]string{
+	strTag:   "a string",
+	intTag:   "a number",
+	floatTag: "a number",
+	boolTag:  "a true/false",
+	nullTag:  "an empty value",
+	seqTag:   "a list",
+	mapTag:   "a map",
+}
 
 // mergeKey is YAML's "inherit these keys from another mapping" operator.
 const mergeKey = "<<"
+
+// keptValuesMark tags a message as one that cost the block no value, for the
+// trip through yaml.v3's error channel.
+//
+// A custom unmarshaler can only hand problems back as a *yaml.TypeError, whose
+// payload is []string, so the tag has to ride inside the text. decode strips
+// it before anybody sees the message; see parseProblem for why the tag has to
+// be applied at the point the message is written.
+const keptValuesMark = "\x00kept-values\x00"
+
+// keptValues marks a message whose block decoded fine apart from the problem
+// being reported.
+func keptValues(msg string) string { return keptValuesMark + msg }
 
 // resolveAlias follows an alias to the node it points at. Aliases never nest —
 // an anchor is always attached to a real node — so one hop is enough.
@@ -45,20 +81,16 @@ func describeNode(n *yaml.Node) string {
 	n = resolveAlias(n)
 	switch n.Kind {
 	case yaml.ScalarNode:
-		switch n.Tag {
-		case nullTag:
-			return "an empty value"
-		case "!!int", "!!float":
-			return "a number"
-		case "!!bool":
-			return "a true/false"
-		default:
-			return "a string"
+		if shape, ok := tagShapes[n.Tag]; ok {
+			return shape
 		}
+		// An exotic or custom tag (!!timestamp, !!binary) is still text as far
+		// as a reader of the file is concerned.
+		return tagShapes[strTag]
 	case yaml.SequenceNode:
-		return "a list"
+		return tagShapes[seqTag]
 	case yaml.MappingNode:
-		return "a map"
+		return tagShapes[mapTag]
 	default:
 		return "an unsupported value"
 	}

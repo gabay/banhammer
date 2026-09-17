@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/netip"
+	"runtime"
 	"testing"
 	"time"
 
@@ -17,7 +18,7 @@ func TestOffendFirstOffenseIsExactlyBantime(t *testing.T) {
 	m.SetPolicy("sshd", Policy{Bantime: time.Hour, BantimeMax: 24 * time.Hour, FindHistory: 24 * time.Hour, Factor: 1})
 
 	ip := addr(t, "198.51.100.7")
-	m.Offend("sshd", ip, 5)
+	m.Offend("sshd", ip, 5, "")
 
 	snap := m.Snapshot()
 	if len(snap) != 1 {
@@ -41,8 +42,8 @@ func TestOffendNormalizesV4In6(t *testing.T) {
 	m, _, _, _ := newTestManager(t, nil)
 	m.SetPolicy("sshd", Policy{Bantime: time.Hour})
 
-	m.Offend("sshd", addr(t, "::ffff:198.51.100.7"), 5)
-	m.Offend("sshd", addr(t, "198.51.100.7"), 5) // same key, must not double-ban
+	m.Offend("sshd", addr(t, "::ffff:198.51.100.7"), 5, "")
+	m.Offend("sshd", addr(t, "198.51.100.7"), 5, "") // same key, must not double-ban
 
 	snap := m.Snapshot()
 	if len(snap) != 1 {
@@ -56,7 +57,7 @@ func TestOffendNormalizesV4In6(t *testing.T) {
 func TestOffendInvalidAddrIsIgnored(t *testing.T) {
 	t.Parallel()
 	m, _, fe, fp := newTestManager(t, nil)
-	m.Offend("sshd", netip.Addr{}, 5)
+	m.Offend("sshd", netip.Addr{}, 5, "")
 	if len(fe.banned()) != 0 || fp.calls() != 0 || len(m.Snapshot()) != 0 {
 		t.Error("an invalid address must not produce a ban")
 	}
@@ -87,8 +88,8 @@ func TestOffendRepeatHandling(t *testing.T) {
 				Factor: tt.factor, OnRepeat: tt.onRepeat,
 			})
 			ip := addr(t, "198.51.100.8")
-			m.Offend("sshd", ip, 5)
-			m.Offend("sshd", ip, 9)
+			m.Offend("sshd", ip, 5, "")
+			m.Offend("sshd", ip, 9, "")
 
 			snap := m.Snapshot()
 			if len(snap) != 1 {
@@ -121,7 +122,7 @@ func TestOffendEscalationAcrossExpiries(t *testing.T) {
 
 	want := []time.Duration{time.Hour, 2 * time.Hour, 4 * time.Hour, 8 * time.Hour, 8 * time.Hour}
 	for i, w := range want {
-		m.Offend("sshd", ip, 5)
+		m.Offend("sshd", ip, 5, "")
 		snap := m.Snapshot()
 		if len(snap) != 1 {
 			t.Fatalf("offense %d: snapshot = %v, want 1 ban", i+1, snap)
@@ -147,10 +148,10 @@ func TestOffendHistoryPrunedByFindHistory(t *testing.T) {
 	m.SetPolicy("sshd", Policy{Bantime: time.Hour, BantimeMax: 24 * time.Hour, FindHistory: 4 * time.Hour, Factor: 2})
 	ip := addr(t, "198.51.100.10")
 
-	m.Offend("sshd", ip, 5)
+	m.Offend("sshd", ip, 5, "")
 	clk.Advance(time.Hour)
 	m.expireAndSchedule()
-	m.Offend("sshd", ip, 5) // second offense inside find_history: 2h
+	m.Offend("sshd", ip, 5, "") // second offense inside find_history: 2h
 	if got := m.Snapshot()[0].Until.Sub(clk.Now()); got != 2*time.Hour {
 		t.Fatalf("second offense bantime = %v, want 2h", got)
 	}
@@ -158,7 +159,7 @@ func TestOffendHistoryPrunedByFindHistory(t *testing.T) {
 	// Walk past find_history with no further offenses; the slate is wiped.
 	clk.Advance(5 * time.Hour)
 	m.expireAndSchedule()
-	m.Offend("sshd", ip, 5)
+	m.Offend("sshd", ip, 5, "")
 	if got := m.Snapshot()[0].Until.Sub(clk.Now()); got != time.Hour {
 		t.Errorf("bantime after find_history elapsed = %v, want a first-offense 1h", got)
 	}
@@ -175,10 +176,10 @@ func TestOffendHistoryIsPerMonitor(t *testing.T) {
 	m.SetPolicy("nginx", p)
 	ip := addr(t, "198.51.100.11")
 
-	m.Offend("sshd", ip, 5)
+	m.Offend("sshd", ip, 5, "")
 	clk.Advance(time.Hour)
 	m.expireAndSchedule()
-	m.Offend("nginx", ip, 5)
+	m.Offend("nginx", ip, 5, "")
 	if got := m.Snapshot()[0].Offense; got != 1 {
 		t.Errorf("offense under a different monitor = %d, want 1 (history is per monitor)", got)
 	}
@@ -194,7 +195,7 @@ func TestIgnoredRepeatsDoNotEscalate(t *testing.T) {
 	m.SetPolicy("sshd", Policy{Bantime: time.Hour, BantimeMax: 100 * time.Hour, FindHistory: 24 * time.Hour, Factor: 2})
 
 	for range 500 {
-		m.Offend("sshd", key.ip, 5)
+		m.Offend("sshd", key.ip, 5, "")
 	}
 	m.mu.Lock()
 	n := len(m.history[key])
@@ -205,7 +206,7 @@ func TestIgnoredRepeatsDoNotEscalate(t *testing.T) {
 
 	clk.Advance(time.Hour)
 	m.expireAndSchedule()
-	m.Offend("sshd", key.ip, 5)
+	m.Offend("sshd", key.ip, 5, "")
 	if got := m.Snapshot()[0].Until.Sub(clk.Now()); got != 2*time.Hour {
 		t.Errorf("bantime after the flood = %v, want a second-offense 2h", got)
 	}
@@ -221,7 +222,7 @@ func TestOffenseHistoryIsCapped(t *testing.T) {
 		Factor: 2, OnRepeat: OnRepeatExtend,
 	})
 	for range 4 * maxOffenseHistory {
-		m.Offend("sshd", key.ip, 5)
+		m.Offend("sshd", key.ip, 5, "")
 		clk.Advance(time.Minute) // each offense pushes Until out, so each commits
 	}
 	m.mu.Lock()
@@ -243,7 +244,7 @@ func TestOffendSweepsHistory(t *testing.T) {
 	// trigger the periodic sweep.
 	for i := range historySweepEvery {
 		ip := netip.AddrFrom4([4]byte{203, 0, byte(i >> 8), byte(i)})
-		m.Offend("sshd", ip, 5)
+		m.Offend("sshd", ip, 5, "")
 	}
 	m.mu.Lock()
 	before := len(m.history)
@@ -256,7 +257,7 @@ func TestOffendSweepsHistory(t *testing.T) {
 	m.expireAndSchedule()
 	// The next offense crosses the sweep counter and prunes the aged entries.
 	for range historySweepEvery {
-		m.Offend("sshd", addr(t, "203.1.1.1"), 5)
+		m.Offend("sshd", addr(t, "203.1.1.1"), 5, "")
 	}
 	m.mu.Lock()
 	after := len(m.history)
@@ -398,7 +399,7 @@ func TestPersistFailureKeepsBanEnforced(t *testing.T) {
 
 	// Offend must swallow the error entirely rather than stall the pipeline.
 	m.SetPolicy("sshd", Policy{Bantime: time.Hour})
-	m.Offend("sshd", addr(t, "198.51.100.31"), 5)
+	m.Offend("sshd", addr(t, "198.51.100.31"), 5, "")
 	if len(m.Snapshot()) != 2 {
 		t.Error("Offend dropped a ban because persistence failed")
 	}
@@ -663,7 +664,7 @@ func TestRunExpiresAndStops(t *testing.T) {
 	go func() { done <- m.Run(ctx) }()
 
 	ip := addr(t, "198.51.100.60")
-	m.Offend("sshd", ip, 5)
+	m.Offend("sshd", ip, 5, "")
 	if _, ok := <-fe.banCh; !ok {
 		t.Fatal("no ban enforced")
 	}
@@ -726,27 +727,26 @@ func TestRunRejectsASecondCall(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	started := make(chan struct{})
 	done := make(chan error, 1)
-	go func() {
-		close(started)
-		done <- m.Run(ctx)
-	}()
-	<-started
+	go func() { done <- m.Run(ctx) }()
 
-	// Retry until the first Run has actually flipped the flag; this races with
-	// goroutine start-up, not with the logic under test.
-	var err error
-	for range 1000 {
-		if err = m.Run(ctx); err != nil {
-			break
-		}
+	// Wait for the first Run to claim the manager before contending with it.
+	// Calling Run any earlier would *succeed* and then block forever, because
+	// Run is the expiry loop itself and only returns on ctx.Done — the previous
+	// version of this test retried in a loop and deadlocked for the full test
+	// timeout whenever the scheduler ran the test goroutine first.
+	for !m.running.Load() {
+		runtime.Gosched()
 	}
-	if !errors.Is(err, ErrRunning) {
+
+	if err := m.Run(ctx); !errors.Is(err, ErrRunning) {
 		t.Fatalf("second Run = %v, want ErrRunning", err)
 	}
+
 	cancel()
-	<-done
+	if err := <-done; err != nil {
+		t.Errorf("first Run = %v, want nil", err)
+	}
 }
 
 func TestStats(t *testing.T) {
@@ -754,9 +754,9 @@ func TestStats(t *testing.T) {
 	m, clk, _, _ := newTestManager(t, func(o *Options) { o.AllowLocal = true })
 	m.SetPolicy("sshd", Policy{Bantime: time.Hour, FindHistory: 24 * time.Hour, Factor: 2, OnRepeat: OnRepeatExtend})
 
-	m.Offend("sshd", addr(t, "127.0.0.1"), 5)
-	m.Offend("sshd", addr(t, "198.51.100.80"), 5)
-	m.Offend("sshd", addr(t, "198.51.100.80"), 5) // extends
+	m.Offend("sshd", addr(t, "127.0.0.1"), 5, "")
+	m.Offend("sshd", addr(t, "198.51.100.80"), 5, "")
+	m.Offend("sshd", addr(t, "198.51.100.80"), 5, "") // extends
 	if err := m.Ban(addr(t, "198.51.100.81"), "manual", time.Minute); err != nil {
 		t.Fatal(err)
 	}
@@ -778,14 +778,14 @@ func TestSetPolicyFallback(t *testing.T) {
 	m, clk, _, _ := newTestManager(t, nil)
 	m.SetPolicy("", Policy{Bantime: 15 * time.Minute, FindHistory: time.Hour, Factor: 1})
 
-	m.Offend("monitor-that-was-removed", addr(t, "198.51.100.90"), 5)
+	m.Offend("monitor-that-was-removed", addr(t, "198.51.100.90"), 5, "")
 	if got := m.Snapshot()[0].Until.Sub(clk.Now()); got != 15*time.Minute {
 		t.Errorf("bantime = %v, want the fallback policy's 15m", got)
 	}
 
 	// With no policy at all, the package defaults apply.
 	m2, clk2, _, _ := newTestManager(t, nil)
-	m2.Offend("unknown", addr(t, "198.51.100.91"), 5)
+	m2.Offend("unknown", addr(t, "198.51.100.91"), 5, "")
 	if got := m2.Snapshot()[0].Until.Sub(clk2.Now()); got != defaultBantime {
 		t.Errorf("bantime = %v, want the default %v", got, defaultBantime)
 	}
@@ -795,7 +795,7 @@ func TestZeroPolicyNeverProducesAnInstantBan(t *testing.T) {
 	t.Parallel()
 	m, clk, _, _ := newTestManager(t, nil)
 	m.SetPolicy("sshd", Policy{}) // e.g. a config bug upstream
-	m.Offend("sshd", addr(t, "198.51.100.92"), 5)
+	m.Offend("sshd", addr(t, "198.51.100.92"), 5, "")
 	b := m.Snapshot()[0]
 	if !b.Until.After(clk.Now()) {
 		t.Fatalf("ban expires at %v, which is not after now %v", b.Until, clk.Now())

@@ -34,6 +34,11 @@ var (
 	// held by an active, responsive process, preventing accidental dual-daemon runs.
 	ErrSocketInUse = errors.New("control: socket already in use")
 
+	// ErrNotASocket indicates that the control socket path is occupied by
+	// something that is not a socket. Banhammer refuses to unlink it: the path
+	// is operator-supplied, and a typo must not delete a config file.
+	ErrNotASocket = errors.New("control: path exists and is not a socket")
+
 	// ErrClosed indicates an operation was attempted on a server or client that
 	// has already been terminated.
 	ErrClosed = errors.New("control: closed")
@@ -89,6 +94,31 @@ type StatusResponse struct {
 	Stats    Stats           `json:"stats"`
 }
 
+// MarshalJSON keeps the wire format readable and symmetric with
+// UnmarshalJSON.
+//
+// time.Duration marshals as an integer count of nanoseconds by default, so
+// `banhammer status --json` used to report "uptime": 7200000000000. It is
+// emitted as "2h0m0s" instead — which the decoder already accepts — alongside
+// uptime_seconds for anything doing arithmetic on it.
+func (s StatusResponse) MarshalJSON() ([]byte, error) {
+	type Alias StatusResponse
+	aux := struct {
+		Uptime        string  `json:"uptime"`
+		UptimeSeconds float64 `json:"uptime_seconds"`
+		Alias
+	}{
+		Uptime:        s.Uptime.String(),
+		UptimeSeconds: s.Uptime.Seconds(),
+		Alias:         Alias(s),
+	}
+	data, err := json.Marshal(aux)
+	if err != nil {
+		return nil, fmt.Errorf("control: marshal StatusResponse: %w", err)
+	}
+	return data, nil
+}
+
 // UnmarshalJSON provides flexible decoding of StatusResponse, accepting Uptime
 // both as an integer count of nanoseconds and as a standard Go duration string
 // (e.g. "1h30m").
@@ -140,6 +170,12 @@ type Stats struct {
 	UnbansTotal  int64 `json:"unbans_total"`
 	ActionErrors int64 `json:"action_errors"`
 	DecodeErrors int64 `json:"decode_errors"`
+
+	// TrackedIPs and ActiveBans are point-in-time gauges rather than running
+	// totals, but PROJECT.md §4.9 lists tracked_ips among the counters
+	// `banhammer status` must expose, and the registry totals both.
+	TrackedIPs int64 `json:"tracked_ips"`
+	ActiveBans int64 `json:"active_bans"`
 }
 
 // Request is the serialized envelope transmitted by clients over the control socket.

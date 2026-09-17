@@ -67,9 +67,10 @@ type rawMonitor struct {
 }
 
 // rawAction is the `action:` value: either a backend name or a block of
-// command templates.
+// command templates / backend parameters.
 type rawAction struct {
 	Name    *string   `yaml:"name"`
+	Chain   *string   `yaml:"chain"`
 	Start   *string   `yaml:"start"`
 	Ban     *string   `yaml:"ban"`
 	Unban   *string   `yaml:"unban"`
@@ -113,6 +114,8 @@ func (a *rawAction) UnmarshalYAML(n *yaml.Node) error {
 			switch key {
 			case "name":
 				msgs = appendString(msgs, &a.Name, key, vn)
+			case "chain":
+				msgs = appendString(msgs, &a.Chain, key, vn)
 			case "start":
 				msgs = appendString(msgs, &a.Start, key, vn)
 			case "ban":
@@ -136,7 +139,9 @@ func (a *rawAction) UnmarshalYAML(n *yaml.Node) error {
 				}
 				a.Timeout = &d
 			default:
-				msgs = append(msgs, unknownKeyMsg(kn.Line, key, "an action", actionKeys()))
+				// Every other key in the block was still stored, so the
+				// monitor around it is worth validating.
+				msgs = append(msgs, keptValues(unknownKeyMsg(kn.Line, key, "an action", actionKeys())))
 			}
 		}
 		return nodeErrs(msgs...)
@@ -179,12 +184,27 @@ func typeErrorMessages(err error) []string {
 	return []string{err.Error()}
 }
 
+// parseProblem is one decode-time problem, tagged where it is created with
+// whether the surrounding block still has its values.
+//
+// The tag cannot be recovered afterwards: by the time parse sees a problem it
+// is a sentence, and deciding "was this only a typo?" by reading that sentence
+// turns a reworded message into a silently weaker check.
+type parseProblem struct {
+	err error
+	// valuesLost says the block this problem came from is missing a value, so
+	// validating it would invent problems on top of the real one. An unknown
+	// key is the counter-example: yaml notes it and every other value in the
+	// block decodes fine, so that block must still be validated.
+	valuesLost bool
+}
+
 // decode parses src strictly and returns the raw document plus every problem
 // found, already rewritten into human phrasing.
 //
 // A syntax error (as opposed to a schema error) yields a nil document: nothing
 // downstream can be trusted after the parser has lost its place.
-func decode(src []byte) (*rawConfig, []error) {
+func decode(src []byte) (*rawConfig, []parseProblem) {
 	var raw rawConfig
 	dec := yaml.NewDecoder(bytes.NewReader(src))
 	dec.KnownFields(true)
@@ -196,31 +216,41 @@ func decode(src []byte) (*rawConfig, []error) {
 		// declares no monitors.
 		return &raw, nil
 	case err == nil:
-		// Anything after the first document is ignored by the decoder, which
-		// is worse than an error: the user's edits would appear to do nothing.
-		// A second document that does not even parse must be reported too —
-		// otherwise a typo below a stray "---" deletes half the config in
-		// silence.
-		var extra yaml.Node
-		switch err := dec.Decode(&extra); {
-		case err == nil:
-			return &raw, []error{fmt.Errorf("line %d: the file contains more than one YAML document (a stray %q?); only the first would be used", extra.Line, "---")}
-		case !errors.Is(err, io.EOF):
-			return &raw, []error{fmt.Errorf("there is a second YAML document (a stray %q?) and it does not parse: %w", "---", err)}
-		}
-		return &raw, nil
+		return &raw, extraDocument(dec)
 	}
 
 	var te *yaml.TypeError
 	if errors.As(err, &te) {
-		msgs := te.Errors
-		out := make([]error, 0, len(msgs))
-		for _, m := range msgs {
-			out = append(out, errors.New(humanize(m)))
+		out := make([]parseProblem, 0, len(te.Errors)+1)
+		for _, m := range te.Errors {
+			text, valuesLost := humanize(m)
+			out = append(out, parseProblem{err: errors.New(text), valuesLost: valuesLost})
 		}
-		return &raw, out
+		// A schema error in the first document is no reason to stop looking
+		// for a second one: a stray "---" silently deletes everything below
+		// it, which is the worse of the two problems, and the user would
+		// otherwise only hear about it on the next round-trip.
+		return &raw, append(out, extraDocument(dec)...)
 	}
-	return nil, []error{syntaxError(src, err)}
+	return nil, []parseProblem{{err: syntaxError(src, err), valuesLost: true}}
+}
+
+// extraDocument reports anything after the first YAML document.
+//
+// The decoder simply ignores it, which is worse than an error: the user's
+// edits would appear to do nothing. A second document that does not even parse
+// must be reported too — otherwise a typo below a stray "---" deletes half the
+// config in silence. Neither costs the first document a value, so neither
+// suppresses its validation.
+func extraDocument(dec *yaml.Decoder) []parseProblem {
+	var extra yaml.Node
+	switch err := dec.Decode(&extra); {
+	case err == nil:
+		return []parseProblem{{err: fmt.Errorf("line %d: the file contains more than one YAML document (a stray %q?); only the first would be used", extra.Line, "---")}}
+	case !errors.Is(err, io.EOF):
+		return []parseProblem{{err: fmt.Errorf("there is a second YAML document (a stray %q?) and it does not parse: %w", "---", err)}}
+	}
+	return nil
 }
 
 // tabbedLine reports the first line indented with a tab, which YAML forbids.
@@ -254,37 +284,58 @@ var fieldNotFoundRe = regexp.MustCompile(`^line (\d+): field (.+) not found in t
 // value is absent for collections and truncated for long scalars.
 var cannotUnmarshalRe = regexp.MustCompile("^line (\\d+): cannot unmarshal (!![a-z]+)(?: `(.*)`)? into (.+)$")
 
-// humanize rewrites one yaml.v3 message into something actionable. Messages it
-// does not recognise are passed through unchanged rather than mangled.
-func humanize(msg string) string {
+// yaml.v3's duplicate-key message, e.g.
+// `line 5: mapping key "sshd" already defined at line 3`. uniqueKeys is always
+// on in yaml.v3, so this is not an option this package could turn off.
+var duplicateKeyRe = regexp.MustCompile(`^line (\d+): mapping key "(.*)" already defined at line (\d+)$`)
+
+// humanize rewrites one yaml.v3 message into something actionable and reports
+// whether the problem cost the block a value. Messages it does not recognise
+// are passed through unchanged rather than mangled, and assumed destructive:
+// inventing extra problems is a smaller sin than hiding a real one behind a
+// message nobody has read yet.
+func humanize(msg string) (text string, valuesLost bool) {
+	if text, ok := strings.CutPrefix(msg, keptValuesMark); ok {
+		// One of this package's own unmarshalers phrased this one and marked
+		// it as costing nothing.
+		return text, false
+	}
 	if m := fieldNotFoundRe.FindStringSubmatch(msg); m != nil {
 		line, err := strconv.Atoi(m[1])
 		if err != nil {
-			return msg
+			return msg, true
 		}
 		key, typeName := m[2], m[3]
 		label, ok := typeLabels[typeName]
 		if !ok {
-			return msg
+			return msg, true
 		}
-		return unknownKeyMsg(line, key, label, keysFor(typeName))
+		// yaml records the unknown key and decodes the rest of the block, so
+		// every other value in it is good.
+		return unknownKeyMsg(line, key, label, keysFor(typeName)), false
 	}
 	if m := cannotUnmarshalRe.FindStringSubmatch(msg); m != nil {
-		return wrongShapeMsg(m[1], m[2], m[3], m[4], msg)
+		return wrongShapeMsg(m[1], m[2], m[3], m[4], msg), true
 	}
-	return msg
+	if m := duplicateKeyRe.FindStringSubmatch(msg); m != nil {
+		return duplicateKeyMsg(m[1], m[2], m[3], msg), true
+	}
+	return msg, true
 }
 
-// tagShapes translates a YAML tag into the words used everywhere else in this
-// package's diagnostics.
-var tagShapes = map[string]string{
-	"!!str":   "a string",
-	"!!int":   "a number",
-	"!!float": "a number",
-	"!!bool":  "a true/false",
-	"!!null":  "an empty value",
-	"!!seq":   "a list",
-	"!!map":   "a map",
+// duplicateKeyMsg explains a repeated key without the "mapping key" jargon,
+// and warns about the collateral damage: yaml.v3 abandons the whole block
+// rather than pick a winner, so everything in it goes missing.
+func duplicateKeyMsg(lineText, key, firstText, fallback string) string {
+	line, err := strconv.Atoi(lineText)
+	if err != nil {
+		return fallback
+	}
+	first, err := strconv.Atoi(firstText)
+	if err != nil {
+		return fallback
+	}
+	return fmt.Sprintf("line %d: key %q is already set at line %d; remove one of them (while it is ambiguous the whole block is dropped)", line, key, first)
 }
 
 // goTypeShapes translates the Go types yaml names in its messages back into

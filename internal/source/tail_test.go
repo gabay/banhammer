@@ -6,7 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"runtime"
+
 	"strings"
 	"testing"
 	"time"
@@ -182,6 +182,16 @@ func TestTailStartAt(t *testing.T) {
 			startAt: startAtCheckpoint,
 			lookup: func(p string, id fileID) fakeLookup {
 				return fakeLookup{p: {Path: p, Dev: id.dev, Inode: id.ino, Offset: 9999}}
+			},
+			want: []string{"old1", "old2", "new1"},
+		},
+		{
+			// A hand-edited or corrupted offsets.json. Seeking to a negative
+			// offset fails outright, so it has to be clamped.
+			name:    "negative checkpoint offset restarts from zero",
+			startAt: startAtCheckpoint,
+			lookup: func(p string, id fileID) fakeLookup {
+				return fakeLookup{p: {Path: p, Dev: id.dev, Inode: id.ino, Offset: -5}}
 			},
 			want: []string{"old1", "old2", "new1"},
 		},
@@ -400,8 +410,17 @@ func TestTailMissingFileWarnsOnceThenFollows(t *testing.T) {
 	tl, h2 := newTestTail(t, path, startAtBeginning, nil, true)
 	h := start(t, tl)
 
-	// Let several poll cycles go by with the file still absent.
-	time.Sleep(60 * time.Millisecond)
+	// Wait for the tailer to have actually looked for the file and given up
+	// on it, rather than sleeping for a duration that is simultaneously too
+	// long here and too short on a loaded machine.
+	waitFor(t, "the missing-file warning", func() bool {
+		return h2.count(slog.LevelWarn, "does not exist") >= 1
+	})
+	// Let a few more poll cycles go by with the file still absent, so the
+	// "once" in warn-once is really being tested.
+	for range 3 {
+		waitTailer(t, tl, path).nudge()
+	}
 	writeFile(t, path, "hello\n")
 
 	if got := h.lines(1); !equalStrings(got, []string{"hello"}) {
@@ -453,7 +472,10 @@ func TestTailGlob(t *testing.T) {
 // A glob member that is deleted (not rotated) must have its descriptor
 // released and its tailer retired, or a daily-rotating glob accumulates
 // goroutines and pins deleted files for the life of the daemon.
-func TestTailGlobRetiresDeletedFile(t *testing.T) {
+//
+// Its checkpoint must *survive* that, though: the path may come back, and
+// re-reading a file we have already emitted means re-counting every hit in it.
+func TestTailGlobRetiresDeletedFileButKeepsCheckpoint(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	a := filepath.Join(dir, "a.log")
@@ -467,27 +489,122 @@ func TestTailGlobRetiresDeletedFile(t *testing.T) {
 		t.Fatalf("lines = %q", got)
 	}
 	waitTailer(t, tl, b)
+	waitOffsetSet(t, tl, b)
 
 	if err := os.Remove(b); err != nil {
 		t.Fatalf("remove: %v", err)
 	}
-	deadline := time.Now().Add(waitTimeout)
-	for time.Now().Before(deadline) {
+	waitFor(t, "the tailer for the deleted file to be retired", func() bool {
 		tl.mu.Lock()
+		defer tl.mu.Unlock()
 		_, live := tl.files[b]
-		_, saved := tl.saved[b]
-		tl.mu.Unlock()
-		if !live && !saved {
-			// The surviving file must still work.
-			appendFile(t, a, "a2\n")
-			if got := h.lines(1); !equalStrings(got, []string{"a2"}) {
-				t.Fatalf("lines = %q, want [a2]", got)
-			}
-			return
-		}
-		time.Sleep(5 * time.Millisecond)
+		return !live
+	})
+
+	tl.mu.Lock()
+	cp, saved := tl.saved[b]
+	tl.mu.Unlock()
+	if !saved {
+		t.Errorf("checkpoint for %s was dropped when its tailer retired; a file that comes back would be replayed", b)
 	}
-	t.Fatal("tailer for the deleted file was never retired")
+	if saved && cp.Offset != int64(len("b1\n")) {
+		t.Errorf("kept checkpoint offset = %d, want %d", cp.Offset, len("b1\n"))
+	}
+	// The watch must go with the tailer, or a churning glob leaks one inotify
+	// watch per file.
+	tl.mu.Lock()
+	w := tl.watcher
+	tl.mu.Unlock()
+	if w != nil {
+		for _, p := range w.WatchList() {
+			if p == b {
+				t.Errorf("watch on %s outlived its tailer", b)
+			}
+		}
+	}
+
+	// The surviving file must still work.
+	appendFile(t, a, "a2\n")
+	if got := h.lines(1); !equalStrings(got, []string{"a2"}) {
+		t.Fatalf("lines = %q, want [a2]", got)
+	}
+}
+
+// A file that newly matches a glob is not automatically new: a rotated archive
+// or a restored backup arrives with a full history behind it. Replaying it
+// would trip every threshold at once, so start_at decides, exactly as it does
+// for a file present at startup.
+func TestTailGlobRescanHonoursStartAt(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		startAt string
+		// withCheckpoint pre-loads the store with an offset for the file
+		// that is about to appear, the way a restart would find one.
+		withCheckpoint bool
+		// wantFromNewFile is what must arrive from the rediscovered file.
+		wantFromNewFile []string
+	}{
+		{
+			name:            "end skips the history it arrived with",
+			startAt:         startAtEnd,
+			wantFromNewFile: []string{"b-live"},
+		},
+		{
+			name:            "checkpoint with no saved offset falls back to end",
+			startAt:         startAtCheckpoint,
+			wantFromNewFile: []string{"b-live"},
+		},
+		{
+			name:            "checkpoint resumes mid-file",
+			startAt:         startAtCheckpoint,
+			withCheckpoint:  true,
+			wantFromNewFile: []string{"b-old2", "b-live"},
+		},
+		{
+			name:            "beginning still replays, for monitors that ask for it",
+			startAt:         startAtBeginning,
+			wantFromNewFile: []string{"b-old1", "b-old2", "b-live"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			a := filepath.Join(dir, "a.log")
+			b := filepath.Join(dir, "b.log")
+			writeFile(t, a, "")
+
+			// Stage the newcomer outside the glob, so the store can be
+			// populated (with the real inode) before anything reads it: the
+			// fake store is a plain map and the tailer reads it from its own
+			// goroutine. Moving a file into place is also exactly how an
+			// archive or a restored backup shows up.
+			staged := filepath.Join(dir, "b.staged")
+			writeFile(t, staged, "b-old1\nb-old2\n")
+
+			store := fakeLookup{}
+			if tc.withCheckpoint {
+				id := inodeOf(t, staged)
+				store[b] = model.Checkpoint{Path: b, Dev: id.dev, Inode: id.ino, Offset: int64(len("b-old1\n"))}
+			}
+
+			tl, _ := newTestTail(t, filepath.Join(dir, "*.log"), tc.startAt, store, true)
+			h := start(t, tl)
+			waitOffsetSet(t, tl, a)
+
+			if err := os.Rename(staged, b); err != nil {
+				t.Fatalf("rename: %v", err)
+			}
+			waitOffsetSet(t, tl, b)
+
+			appendFile(t, b, "b-live\n")
+			if got := h.lines(len(tc.wantFromNewFile)); !equalStrings(got, tc.wantFromNewFile) {
+				t.Fatalf("lines = %q, want %q", got, tc.wantFromNewFile)
+			}
+			h.expectQuiet()
+		})
+	}
 }
 
 // Deleting and recreating a plain (non-glob) file must resume, not wedge.
@@ -508,6 +625,155 @@ func TestTailFileDeletedThenRecreated(t *testing.T) {
 	writeFile(t, path, "after\n")
 	if got := h.lines(1); !equalStrings(got, []string{"after"}) {
 		t.Fatalf("lines = %q, want [after]", got)
+	}
+}
+
+// When the inode is unlinked, EOF stops meaning "the writer has not finished
+// this line yet" and starts meaning "nobody ever will". The unterminated
+// trailing line is then real data — often the last thing written before
+// someone ran `rm` — so it must be emitted, not dropped.
+func TestTailDeletedFileFlushesTrailingLine(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.log")
+	writeFile(t, path, "complete\nunterminated-last-words")
+
+	tl, _ := newTestTail(t, path, startAtBeginning, nil, false)
+	tl.poll = time.Hour // only manual nudges advance the tailer
+	h := start(t, tl)
+	ft := waitTailer(t, tl, path)
+
+	if got := h.lines(1); !equalStrings(got, []string{"complete"}) {
+		t.Fatalf("lines = %q, want [complete] (the partial line must be withheld while the file lives)", got)
+	}
+	h.expectQuiet()
+
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	ft.nudge()
+	if got := h.lines(1); !equalStrings(got, []string{"unterminated-last-words"}) {
+		t.Fatalf("lines = %q, want the trailing line flushed once the inode was gone", got)
+	}
+}
+
+// A fragment dropped at rotation is a line of log thrown away. That is the
+// right call (the writer finishes it in the new file), but it must be counted
+// rather than whispered at Debug.
+func TestTailRotationCountsDiscardedFragment(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.log")
+	writeFile(t, path, "a1\nhalf-a-line")
+
+	tl, h2 := newTestTail(t, path, startAtBeginning, nil, false)
+	tl.poll = time.Hour
+	h := start(t, tl)
+	ft := waitTailer(t, tl, path)
+	if got := h.lines(1); !equalStrings(got, []string{"a1"}) {
+		t.Fatalf("lines = %q", got)
+	}
+
+	if err := os.Rename(path, filepath.Join(dir, "app.log.1")); err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	writeFile(t, path, "b1\n")
+	ft.nudge()
+
+	if got := h.lines(1); !equalStrings(got, []string{"b1"}) {
+		t.Fatalf("lines = %q, want [b1]", got)
+	}
+	if got := tl.Stats().DiscardedPartialLines; got != 1 {
+		t.Errorf("Stats().DiscardedPartialLines = %d, want 1", got)
+	}
+	if n := h2.count(slog.LevelWarn, "discarded an unterminated trailing line"); n != 1 {
+		t.Errorf("discard warnings = %d, want 1", n)
+	}
+}
+
+// Over-long lines are truncated and counted; a tailer never sees an
+// authoritative EOF, so the count has to surface without one.
+func TestTailCountsTruncatedLines(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "app.log")
+	writeFile(t, path, "")
+
+	tl, _ := newTestTail(t, path, startAtBeginning, nil, true)
+	h := start(t, tl)
+	waitOffsetSet(t, tl, path)
+
+	appendFile(t, path, strings.Repeat("x", maxLineBytes+1)+"\nshort\n")
+	if got := h.lines(2); len(got) != 2 {
+		t.Fatalf("lines = %q", got)
+	}
+	// The file is still open and still being tailed: no EOF, no shutdown.
+	waitFor(t, "the truncation to be counted", func() bool {
+		return tl.Stats().TruncatedLines == 1
+	})
+}
+
+// A permanently failing file (EACCES on a log we may not read) retries every
+// poll tick. Without rate limiting that is a warning a second, forever, per
+// file — 86400 identical lines a day, hiding everything else.
+func TestTailPermanentErrorWarnsOnlyOnce(t *testing.T) {
+	t.Parallel()
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: permission bits do not deny us anything")
+	}
+	path := filepath.Join(t.TempDir(), "unreadable.log")
+	writeFile(t, path, "secret\n")
+	if err := os.Chmod(path, 0o000); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+
+	tl, h2 := newTestTail(t, path, startAtBeginning, nil, false)
+	tl.poll = time.Millisecond // hammer the failing path
+	start(t, tl)
+
+	waitFor(t, "the first open failure to be reported", func() bool {
+		return h2.count(slog.LevelWarn, "tail error") >= 1
+	})
+	// Prove the repeats really happened and really were swallowed, rather
+	// than just not arriving yet: the limiter counts what it drops.
+	ft := waitTailer(t, tl, path)
+	waitFor(t, "repeated failures to be suppressed", func() bool {
+		ft.errWarn.mu.Lock()
+		defer ft.errWarn.mu.Unlock()
+		return ft.errWarn.suppressed >= 5
+	})
+	if n := h2.count(slog.LevelWarn, "tail error"); n != 1 {
+		t.Errorf("tail error warnings = %d, want exactly 1 within the rate-limit window", n)
+	}
+}
+
+// Exhausting the per-wakeup round budget must re-arm the tailer rather than
+// spin or drop data: the next wakeup picks up where this one stopped.
+func TestTailPumpRoundLimitReArms(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app.log")
+	writeFile(t, path, "a1\n")
+
+	tl, _ := newTestTail(t, path, startAtBeginning, nil, false)
+	tl.poll = time.Hour
+	tl.rounds = 1 // one state transition per wakeup, then back to the queue
+	h := start(t, tl)
+	ft := waitTailer(t, tl, path)
+	if got := h.lines(1); !equalStrings(got, []string{"a1"}) {
+		t.Fatalf("lines = %q", got)
+	}
+
+	// With rounds == 1 the rotation itself consumes the wakeup's only round,
+	// so reading the replacement file depends entirely on pump having
+	// re-nudged itself.
+	if err := os.Rename(path, filepath.Join(dir, "app.log.1")); err != nil {
+		t.Fatalf("rename: %v", err)
+	}
+	writeFile(t, path, "b1\n")
+	ft.nudge()
+
+	if got := h.lines(1); !equalStrings(got, []string{"b1"}) {
+		t.Fatalf("lines = %q, want [b1] from the re-armed wakeup", got)
 	}
 }
 
@@ -549,11 +815,12 @@ func TestTailCheckpointsTrackLineBoundaries(t *testing.T) {
 }
 
 func TestTailCancelsPromptlyWithoutLeaking(t *testing.T) {
-	t.Parallel()
+	// Not parallel: this counts goroutines, and a neighbour running
+	// concurrently would be counted too (see sourceGoroutines).
 	path := filepath.Join(t.TempDir(), "app.log")
 	writeFile(t, path, "x\n")
 
-	before := runtime.NumGoroutine()
+	before := sourceGoroutines()
 
 	tl, _ := newTestTail(t, path, startAtBeginning, nil, true)
 	tl.poll = time.Hour // cancellation must not wait for the poll tick
@@ -585,11 +852,11 @@ func TestTailCancelsPromptlyWithoutLeaking(t *testing.T) {
 
 // A blocked send on a full output channel must not wedge shutdown.
 func TestTailCancelWithFullChannel(t *testing.T) {
-	t.Parallel()
+	// Not parallel: see TestTailCancelsPromptlyWithoutLeaking.
 	path := filepath.Join(t.TempDir(), "app.log")
 	writeFile(t, path, strings.Repeat("line\n", 100))
 
-	before := runtime.NumGoroutine()
+	before := sourceGoroutines()
 
 	tl, _ := newTestTail(t, path, startAtBeginning, nil, true)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -597,7 +864,10 @@ func TestTailCancelWithFullChannel(t *testing.T) {
 	errc := make(chan error, 1)
 	go func() { errc <- tl.Run(ctx, events) }()
 
-	time.Sleep(50 * time.Millisecond) // let the tailer block on the send
+	// Wait for the tailer to be genuinely stuck on the send rather than
+	// sleeping for a duration that merely tends to be long enough: it has
+	// published its first checkpoint by then and cannot proceed.
+	waitOffsetSet(t, tl, path)
 	cancel()
 	select {
 	case err := <-errc:

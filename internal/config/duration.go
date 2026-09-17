@@ -1,7 +1,9 @@
 package config
 
 import (
+	"errors"
 	"fmt"
+	"math"
 	"net/netip"
 	"strconv"
 	"strings"
@@ -52,13 +54,18 @@ func (i *intVal) UnmarshalYAML(n *yaml.Node) error {
 	if !ok {
 		return nodeErrs(msgAt(n, "expected a whole number, got %s", describeNode(n)))
 	}
-	if tag := resolveAlias(n).Tag; tag != "!!int" {
+	if tag := resolveAlias(n).Tag; tag != intTag {
 		return nodeErrs(msgAt(n, "expected a whole number, got %s (%s)", describeNode(n), s))
 	}
 	v, err := strconv.Atoi(s)
 	if err != nil {
 		// Reachable for !!int values Atoi rejects: 0x10, 0o17, 1_000, and
-		// anything past the platform's int range.
+		// anything past the platform's int range. Telling someone whose
+		// digits are already plain decimal to write plain decimal digits
+		// sends them looking for a typo that is not there.
+		if errors.Is(err, strconv.ErrRange) {
+			return nodeErrs(msgAt(n, "number %q is out of range: whole numbers here run from %d to %d", s, math.MinInt, math.MaxInt))
+		}
 		return nodeErrs(msgAt(n, "invalid number %q: write it in plain decimal digits", s))
 	}
 	*i = intVal(v)
@@ -76,7 +83,7 @@ func (f *floatVal) UnmarshalYAML(n *yaml.Node) error {
 		return nodeErrs(msgAt(n, "expected a number, got %s", describeNode(n)))
 	}
 	switch resolveAlias(n).Tag {
-	case "!!int", "!!float":
+	case intTag, floatTag:
 	default:
 		return nodeErrs(msgAt(n, "expected a number, got %s (%s)", describeNode(n), s))
 	}

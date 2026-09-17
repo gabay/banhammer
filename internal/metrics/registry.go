@@ -20,6 +20,7 @@
 package metrics
 
 import (
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -28,6 +29,11 @@ import (
 
 	"banhammer/internal/control"
 )
+
+// DefaultPrefix namespaces every metric name. Prometheus convention is a
+// per-application namespace, and bare names like "matches" would collide the
+// moment banhammer shares a scrape target with anything else.
+const DefaultPrefix = "banhammer_"
 
 // labeledMetric encapsulates a family of metric values partitioned by a single label key.
 //
@@ -140,11 +146,14 @@ type Registry struct {
 	clock     func() time.Time
 	startTime time.Time
 	prefix    string
-	mu        sync.RWMutex
-}
 
-// Metrics is an alias for Registry to accommodate alternative naming conventions.
-type Metrics = Registry
+	// collectFn is an optional hook run immediately before the registry is
+	// read, so values owned by another component can be pulled in at scrape
+	// time rather than pushed on every change. See Collect.
+	collectFn func()
+
+	mu sync.RWMutex
+}
 
 // Option configures Registry behavior during initialization.
 type Option func(*Registry)
@@ -159,25 +168,34 @@ func WithClock(now func() time.Time) Option {
 	}
 }
 
-// WithStartTime establishes an explicit reference timestamp for the daemon start time.
-//
-// This is useful for synchronizing metrics with parent process lifecycle supervisors
-// or historical test benchmarks.
+// WithStartTime establishes an explicit reference timestamp for the daemon
+// start time, so uptime can be measured from process start rather than from
+// registry construction.
 func WithStartTime(t time.Time) Option {
 	return func(r *Registry) {
 		r.startTime = t
 	}
 }
 
-// WithPrefix sets an optional namespace prefix prepended to all Prometheus metric names.
+// WithPrefix overrides the namespace prepended to every Prometheus metric name.
 //
-// By default, Banhammer emits standard metric names (e.g. lines_read). Configuring
-// a prefix (such as "banhammer_") permits disambiguation in multi-tenant metric scrapers.
+// It defaults to DefaultPrefix; pass "" to emit bare names. An invalid prefix
+// (one that would produce a name Prometheus cannot parse) is ignored, because a
+// metrics endpoint that a scraper rejects wholesale is worse than one with the
+// default namespace.
 func WithPrefix(prefix string) Option {
 	return func(r *Registry) {
+		if prefix != "" && !validPrefix.MatchString(prefix) {
+			return
+		}
 		r.prefix = prefix
 	}
 }
+
+// validPrefix matches the part of a Prometheus metric name a prefix may
+// contribute: the full name must match [a-zA-Z_:][a-zA-Z0-9_:]*, and the
+// prefix is its head.
+var validPrefix = regexp.MustCompile(`^[a-zA-Z_:][a-zA-Z0-9_:]*$`)
 
 // NewRegistry allocates and initializes a fresh metrics Registry with all standard
 // banhammer collectors ready for use.
@@ -193,6 +211,7 @@ func NewRegistry(opts ...Option) *Registry {
 		trackedIPs:   newLabeledMetric("monitor"),
 		activeBans:   newLabeledMetric("monitor"),
 		clock:        time.Now,
+		prefix:       DefaultPrefix,
 	}
 	for _, opt := range opts {
 		opt(r)
@@ -208,20 +227,28 @@ func New(opts ...Option) *Registry {
 	return NewRegistry(opts...)
 }
 
-// SetClock overrides the time provider after construction.
+// Collect registers a hook to run immediately before the registry is read by
+// WritePrometheus or Stats.
 //
-// This allows test suites to step time forward deterministically without sleeping.
-func (r *Registry) SetClock(now func() time.Time) {
+// It exists so that metrics whose source of truth lives elsewhere — the
+// per-monitor ban counters, which only the ban manager can compute correctly —
+// are refreshed on read instead of being pushed on every state change. The hook
+// must not call back into the registry's read paths.
+func (r *Registry) Collect(f func()) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.clock = now
+	r.collectFn = f
 }
 
-// SetStartTime overrides the starting timestamp used for uptime calculations.
-func (r *Registry) SetStartTime(t time.Time) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.startTime = t
+// collect runs the registered hook, if any, without holding the lock across the
+// call.
+func (r *Registry) collect() {
+	r.mu.RLock()
+	f := r.collectFn
+	r.mu.RUnlock()
+	if f != nil {
+		f()
+	}
 }
 
 func (r *Registry) getPrefix() string {
@@ -249,11 +276,6 @@ func (r *Registry) IncLinesRead(monitor string) {
 	r.linesRead.inc(monitor)
 }
 
-// AddLinesRead increments the lines_read counter by delta for the specified monitor.
-func (r *Registry) AddLinesRead(monitor string, delta int64) {
-	r.linesRead.add(monitor, delta)
-}
-
 // IncLinesDropped increments the lines_dropped counter by 1.
 //
 // If monitor is empty, it is attributed to the "global" queue drop counter.
@@ -261,21 +283,11 @@ func (r *Registry) IncLinesDropped(monitor string) {
 	r.linesDropped.inc(normalizeDroppedMonitor(monitor))
 }
 
-// AddLinesDropped increments the lines_dropped counter by delta.
-//
-// If monitor is empty, it is attributed to the "global" queue drop counter.
+// AddLinesDropped adds delta to the lines_dropped counter for monitor.
 func (r *Registry) AddLinesDropped(monitor string, delta int64) {
-	r.linesDropped.add(normalizeDroppedMonitor(monitor), delta)
-}
-
-// IncGlobalLinesDropped increments the global queue drop counter by 1.
-func (r *Registry) IncGlobalLinesDropped() {
-	r.linesDropped.inc("global")
-}
-
-// AddGlobalLinesDropped increments the global queue drop counter by delta.
-func (r *Registry) AddGlobalLinesDropped(delta int64) {
-	r.linesDropped.add("global", delta)
+	if delta > 0 {
+		r.linesDropped.add(normalizeDroppedMonitor(monitor), delta)
+	}
 }
 
 // IncMatches increments the matches counter by 1 for the specified monitor.
@@ -283,29 +295,19 @@ func (r *Registry) IncMatches(monitor string) {
 	r.matches.inc(monitor)
 }
 
-// AddMatches increments the matches counter by delta for the specified monitor.
-func (r *Registry) AddMatches(monitor string, delta int64) {
-	r.matches.add(monitor, delta)
+// SetBans records the total number of bans issued for monitor.
+//
+// Bans are set rather than incremented because the ban manager, not the
+// pipeline, is the authority on what counts as a new ban: a ban re-applied to
+// the firewall at startup is not one.
+func (r *Registry) SetBans(monitor string, total int64) {
+	r.bans.set(monitor, total)
 }
 
-// IncBans increments the bans counter by 1 for the specified monitor.
-func (r *Registry) IncBans(monitor string) {
-	r.bans.inc(monitor)
-}
-
-// AddBans increments the bans counter by delta for the specified monitor.
-func (r *Registry) AddBans(monitor string, delta int64) {
-	r.bans.add(monitor, delta)
-}
-
-// IncUnbans increments the unbans counter by 1 for the specified monitor.
-func (r *Registry) IncUnbans(monitor string) {
-	r.unbans.inc(monitor)
-}
-
-// AddUnbans increments the unbans counter by delta for the specified monitor.
-func (r *Registry) AddUnbans(monitor string, delta int64) {
-	r.unbans.add(monitor, delta)
+// SetUnbans records the total number of bans lifted for monitor, by expiry or
+// by hand. Set rather than incremented, for the reason given on SetBans.
+func (r *Registry) SetUnbans(monitor string, total int64) {
+	r.unbans.set(monitor, total)
 }
 
 // IncActionErrors increments the action_errors counter by 1 for the specified backend.
@@ -313,19 +315,9 @@ func (r *Registry) IncActionErrors(backend string) {
 	r.actionErrors.inc(normalizeBackend(backend))
 }
 
-// AddActionErrors increments the action_errors counter by delta for the specified backend.
-func (r *Registry) AddActionErrors(backend string, delta int64) {
-	r.actionErrors.add(normalizeBackend(backend), delta)
-}
-
 // IncDecodeErrors increments the decode_errors counter by 1 for the specified monitor.
 func (r *Registry) IncDecodeErrors(monitor string) {
 	r.decodeErrors.inc(monitor)
-}
-
-// AddDecodeErrors increments the decode_errors counter by delta for the specified monitor.
-func (r *Registry) AddDecodeErrors(monitor string, delta int64) {
-	r.decodeErrors.add(monitor, delta)
 }
 
 // SetTrackedIPs updates the gauge recording the count of actively tracked IPs for monitor.
@@ -333,29 +325,9 @@ func (r *Registry) SetTrackedIPs(monitor string, count int64) {
 	r.trackedIPs.set(monitor, count)
 }
 
-// IncTrackedIPs increments the gauge of actively tracked IPs for monitor by 1.
-func (r *Registry) IncTrackedIPs(monitor string) {
-	r.trackedIPs.add(monitor, 1)
-}
-
-// DecTrackedIPs decrements the gauge of actively tracked IPs for monitor by 1.
-func (r *Registry) DecTrackedIPs(monitor string) {
-	r.trackedIPs.add(monitor, -1)
-}
-
 // SetActiveBans updates the gauge recording the current active firewall bans for monitor.
 func (r *Registry) SetActiveBans(monitor string, count int64) {
 	r.activeBans.set(monitor, count)
-}
-
-// IncActiveBans increments the active bans gauge for monitor by 1.
-func (r *Registry) IncActiveBans(monitor string) {
-	r.activeBans.add(monitor, 1)
-}
-
-// DecActiveBans decrements the active bans gauge for monitor by 1.
-func (r *Registry) DecActiveBans(monitor string) {
-	r.activeBans.add(monitor, -1)
 }
 
 // LinesRead returns the total number of lines read recorded for monitor.
@@ -374,12 +346,18 @@ func (r *Registry) Matches(monitor string) int64 {
 }
 
 // Bans returns the total number of bans imposed under monitor.
+//
+// Like every read of a collected metric it refreshes from the Collect hook
+// first, so a caller never sees a value staler than the ban manager's.
 func (r *Registry) Bans(monitor string) int64 {
+	r.collect()
 	return r.bans.get(monitor)
 }
 
-// Unbans returns the total number of unbans completed under monitor.
+// Unbans returns the total number of unbans completed under monitor. It
+// refreshes from the Collect hook first; see Bans.
 func (r *Registry) Unbans(monitor string) int64 {
+	r.collect()
 	return r.unbans.get(monitor)
 }
 
@@ -398,8 +376,10 @@ func (r *Registry) TrackedIPs(monitor string) int64 {
 	return r.trackedIPs.get(monitor)
 }
 
-// ActiveBans returns the current active bans gauge value for monitor.
+// ActiveBans returns the current active bans gauge value for monitor. It
+// refreshes from the Collect hook first; see Bans.
 func (r *Registry) ActiveBans(monitor string) int64 {
+	r.collect()
 	return r.activeBans.get(monitor)
 }
 
@@ -419,12 +399,16 @@ func (r *Registry) TotalMatches() int64 {
 }
 
 // TotalBans returns the aggregate count of bans executed across all monitors.
+// It refreshes from the Collect hook first; see Bans.
 func (r *Registry) TotalBans() int64 {
+	r.collect()
 	return r.bans.total()
 }
 
-// TotalUnbans returns the aggregate count of unbans executed across all monitors.
+// TotalUnbans returns the aggregate count of unbans executed across all
+// monitors. It refreshes from the Collect hook first; see Bans.
 func (r *Registry) TotalUnbans() int64 {
+	r.collect()
 	return r.unbans.total()
 }
 
@@ -443,8 +427,10 @@ func (r *Registry) TotalTrackedIPs() int64 {
 	return r.trackedIPs.total()
 }
 
-// TotalActiveBans returns the aggregate count of active bans across all monitors.
+// TotalActiveBans returns the aggregate count of active bans across all
+// monitors. It refreshes from the Collect hook first; see Bans.
 func (r *Registry) TotalActiveBans() int64 {
+	r.collect()
 	return r.activeBans.total()
 }
 
@@ -467,21 +453,23 @@ func (r *Registry) UptimeSeconds() float64 {
 
 // Stats returns cumulative operational totals aggregated across all monitors
 // and backends for consumption by the control socket IPC status endpoint.
+//
+// It reads the metric cells directly rather than going through the Total*
+// accessors: those collect on every call, and one status response should run
+// the collect hook exactly once, over a single consistent snapshot.
 func (r *Registry) Stats() control.Stats {
+	r.collect()
 	return control.Stats{
-		LinesRead:    r.TotalLinesRead(),
-		LinesDropped: r.TotalLinesDropped(),
-		Matches:      r.TotalMatches(),
-		BansTotal:    r.TotalBans(),
-		UnbansTotal:  r.TotalUnbans(),
-		ActionErrors: r.TotalActionErrors(),
-		DecodeErrors: r.TotalDecodeErrors(),
+		LinesRead:    r.linesRead.total(),
+		LinesDropped: r.linesDropped.total(),
+		Matches:      r.matches.total(),
+		BansTotal:    r.bans.total(),
+		UnbansTotal:  r.unbans.total(),
+		ActionErrors: r.actionErrors.total(),
+		DecodeErrors: r.decodeErrors.total(),
+		TrackedIPs:   r.trackedIPs.total(),
+		ActiveBans:   r.activeBans.total(),
 	}
-}
-
-// SnapshotStats is an alias for Stats providing point-in-time metrics aggregation.
-func (r *Registry) SnapshotStats() control.Stats {
-	return r.Stats()
 }
 
 // InitMonitor pre-populates zero-valued metric entries for the specified monitor.

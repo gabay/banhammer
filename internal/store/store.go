@@ -79,6 +79,15 @@ var ErrClosed = errors.New("store is closed")
 // treat it as the one shutdown failure worth retrying.
 var ErrNotPersisted = errors.New("latest state was not persisted")
 
+// ErrNotDurable marks the weaker failure of a write whose data did reach the
+// file — the rename completed, so the next reader (including a restart) sees
+// the new state — but whose directory fsync failed, so a power cut could
+// still resurrect the old name. It is deliberately *not* ErrNotPersisted:
+// that sentinel promises "the state is only in memory", which is false here,
+// and a caller acting on that promise would keep retrying data it already has
+// on disk. Both are worth retrying; only one means data loss is imminent.
+var ErrNotDurable = errors.New("latest state was written but not fsynced")
+
 // errTooLarge marks a state file we refuse to read; it is handled like any
 // other corruption.
 var errTooLarge = errors.New("state file is implausibly large")
@@ -97,10 +106,22 @@ type Options struct {
 	// time.Now.
 	Now func() time.Time
 	// BanInterval is the debounce window for bans.json. Zero means
-	// DefaultBanInterval; negative means "write synchronously".
+	// DefaultBanInterval. A negative value is rejected rather than given a
+	// second meaning: use SynchronousBans to turn debouncing off.
 	BanInterval time.Duration
+	// SynchronousBans makes SaveBans write bans.json before it returns,
+	// trading the "≤1 write/s" contract for an error the caller can act on
+	// immediately. Only one-shot tools and tests want this; the daemon does
+	// not.
+	SynchronousBans bool
 	// AfterFunc schedules f after d. nil means time.AfterFunc.
 	AfterFunc func(d time.Duration, f func()) Stopper
+
+	// maxFileSize overrides MaxStateFileSize. It is unexported because it
+	// exists solely so tests can exercise the oversize path at Open — which
+	// reads offsets.json before any test can reach into the Store — without
+	// writing 64 MiB to disk.
+	maxFileSize int64
 }
 
 // Store owns a state directory. It is safe for concurrent use: the daemon
@@ -112,8 +133,9 @@ type Store struct {
 	now  func() time.Time
 	lock *os.File
 
-	interval time.Duration
-	after    func(time.Duration, func()) Stopper
+	interval    time.Duration
+	synchronous bool
+	after       func(time.Duration, func()) Stopper
 
 	// writeFile is a seam: tests replace it to count writes and to simulate
 	// a full disk. It always points at writeFileAtomic in production.
@@ -130,6 +152,9 @@ type Store struct {
 	hasPending  bool
 	lastBanAt   time.Time
 	timer       Stopper
+	// gen identifies the debounce timer that is currently allowed to write.
+	// See armTimerLocked for why a token is needed at all.
+	gen uint64
 	// retries counts consecutive failures of the debounced write, to bound
 	// the backoff chain.
 	retries int
@@ -141,7 +166,17 @@ type Store struct {
 
 	offsets map[string]model.Checkpoint
 	byPath  map[string]model.Checkpoint
-	closed  bool
+	// offsetsOnDisk records whether offsets.json holds the current view, so
+	// that an unchanged map can skip the write without ever skipping the
+	// *first* one.
+	offsetsOnDisk bool
+	// clashWarned remembers, per path, the key of the checkpoint that won the
+	// last time several of them named that path. Two monitors on one log file
+	// is a legitimate configuration whose offsets keep advancing, and
+	// SaveOffsets rebuilds the index every few seconds; without this the
+	// daemon would warn about it forever.
+	clashWarned map[string]string
+	closed      bool
 }
 
 // Open prepares dir as a state directory: it creates the path (0755), takes
@@ -154,6 +189,9 @@ func Open(dir string) (*Store, error) { return OpenWith(dir, Options{}) }
 func OpenWith(dir string, o Options) (*Store, error) {
 	if dir == "" {
 		return nil, errors.New("store: state directory must not be empty")
+	}
+	if o.BanInterval < 0 {
+		return nil, fmt.Errorf("store: BanInterval must not be negative (got %v); set SynchronousBans instead", o.BanInterval)
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("store: create state directory %s: %w", dir, err)
@@ -169,17 +207,22 @@ func OpenWith(dir string, o Options) (*Store, error) {
 		now:         o.Now,
 		lock:        lock,
 		interval:    o.BanInterval,
+		synchronous: o.SynchronousBans,
 		after:       o.AfterFunc,
 		writeFile:   writeFileAtomic,
-		maxFileSize: MaxStateFileSize,
+		maxFileSize: o.maxFileSize,
 		offsets:     make(map[string]model.Checkpoint),
 		byPath:      make(map[string]model.Checkpoint),
+		clashWarned: make(map[string]string),
 	}
 	if s.now == nil {
 		s.now = time.Now
 	}
 	if s.interval == 0 {
 		s.interval = DefaultBanInterval
+	}
+	if s.maxFileSize == 0 {
+		s.maxFileSize = MaxStateFileSize
 	}
 	if s.after == nil {
 		s.after = func(d time.Duration, f func()) Stopper { return time.AfterFunc(d, f) }
@@ -190,7 +233,7 @@ func OpenWith(dir string, o Options) (*Store, error) {
 	// flight in this directory.
 	s.sweepTempFiles()
 
-	offsets, err := s.loadOffsetsFromDisk()
+	offsets, onDisk, err := s.loadOffsetsFromDisk()
 	if err != nil {
 		// A state dir we cannot read is a configuration problem, not a
 		// corruption problem: fail loudly at startup.
@@ -198,6 +241,7 @@ func OpenWith(dir string, o Options) (*Store, error) {
 		return nil, fmt.Errorf("store: %w", err)
 	}
 	s.setOffsets(offsets)
+	s.offsetsOnDisk = onDisk
 	return s, nil
 }
 
@@ -219,34 +263,15 @@ func (s *Store) LoadBans() ([]model.Ban, error) {
 		return slices.Clone(s.pendingBans), nil
 	}
 
-	var file struct {
-		Version int         `json:"version"`
-		Bans    []model.Ban `json:"bans"`
-	}
-	ok, err := s.readState(BansFile, &file, func() int { return file.Version })
+	var file bansFile
+	ok, err := s.readState(BansFile, &file)
 	if err != nil {
 		return nil, err
 	}
 	if !ok {
 		return nil, nil
 	}
-	bans := file.Bans[:0:0]
-	for i, b := range file.Bans {
-		// Drop individual junk entries rather than discarding every ban
-		// because one line is broken. This package is the quarantine
-		// boundary; downstream code should not have to defend itself against
-		// values that cannot occur.
-		switch {
-		case !b.IP.IsValid():
-			s.log.Warn("dropping ban with invalid address", "file", BansFile, "index", i)
-		case b.Until.Before(b.At):
-			s.log.Warn("dropping ban that expires before it started",
-				"file", BansFile, "index", i, "ip", b.IP.String(), "at", b.At, "until", b.Until)
-		default:
-			bans = append(bans, b)
-		}
-	}
-	return bans, nil
+	return s.validBans(file.Bans, BansFile), nil
 }
 
 // SaveBans persists bans atomically, debounced to at most one write per
@@ -255,7 +280,8 @@ func (s *Store) LoadBans() ([]model.Ban, error) {
 // the next SaveBans (wrapping ErrNotPersisted) and retried automatically a
 // few times. Call Flush before exiting and check its error.
 //
-// The slice is copied, so the caller may reuse it.
+// The slice is copied, so the caller may reuse it. Entries the load path
+// would refuse are dropped here too — see validBans.
 func (s *Store) SaveBans(bans []model.Ban) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -267,14 +293,20 @@ func (s *Store) SaveBans(bans []model.Ban) error {
 	prev := s.deferredErr
 	s.deferredErr = nil
 
-	s.pendingBans = slices.Clone(bans)
+	// validBans appends into a fresh slice, so this is also the defensive
+	// copy the caller is promised.
+	s.pendingBans = s.validBans(bans, "SaveBans")
 	s.hasPending = true
 
-	if s.interval < 0 {
+	if s.synchronous {
 		if err := s.writeBansLocked(); err != nil {
-			return err
+			// Two independent failures: this call did not reach the disk, and
+			// neither did an earlier one. Dropping either would hide a fault.
+			return errors.Join(err, deferredFailure(prev))
 		}
-		return prev
+		// The current snapshot is on disk, so the older failure no longer
+		// describes anything that is at risk.
+		return nil
 	}
 	if s.timer == nil {
 		// Trailing edge: schedule the write for the end of the current
@@ -284,15 +316,15 @@ func (s *Store) SaveBans(bans []model.Ban) error {
 		if wait < 0 {
 			wait = 0
 		}
-		s.timer = s.after(wait, s.onTimer)
+		s.armTimerLocked(wait)
 	}
-	return prev
+	return deferredFailure(prev)
 }
 
 // Flush forces any pending ban write out immediately. Call it on shutdown:
 // without it the last state change inside a debounce interval would be lost.
-// A non-nil error wraps ErrNotPersisted and means the state is still only in
-// memory; the pending state is kept so a later Flush can retry.
+// A non-nil error wraps ErrNotPersisted (or ErrNotDurable) and means the state
+// is not safely on disk; the pending state is kept so a later Flush can retry.
 func (s *Store) Flush() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -308,11 +340,11 @@ func (s *Store) Flush() error {
 //
 // If that final flush fails, Close deliberately does *not* close the store or
 // release the lock: the newest bans exist only in memory, and letting another
-// daemon take the directory would lose them. The error wraps ErrNotPersisted,
-// and the failure is sticky — every subsequent Close retries the write and
-// fails again until it succeeds, so a caller cannot mistake a second Close
-// for success. Process exit releases the lock regardless, so give up after a
-// bounded number of attempts.
+// daemon take the directory would lose them. The error wraps ErrNotPersisted
+// (or ErrNotDurable), and the failure is sticky — every subsequent Close
+// retries the write and fails again until it succeeds, so a caller cannot
+// mistake a second Close for success. Process exit releases the lock
+// regardless, so give up after a bounded number of attempts.
 //
 // Once the state is durable Close is idempotent and returns nil.
 func (s *Store) Close() error {
@@ -352,25 +384,37 @@ func (s *Store) LoadOffsets() (map[string]model.Checkpoint, error) {
 // SaveOffsets persists the checkpoint map atomically. Unlike bans this is not
 // debounced: the daemon already rate-limits it (every 5s and on shutdown),
 // and a synchronous error is more useful there.
+//
+// An unchanged map is not rewritten. The daemon calls this on a fixed tick
+// whether or not anything moved, and an idle host would otherwise pay ~17k
+// marshal+write+fsync cycles a day to store bytes it already stores.
 func (s *Store) SaveOffsets(offsets map[string]model.Checkpoint) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
 		return fmt.Errorf("store: SaveOffsets: %w", ErrClosed)
 	}
-	data, err := marshalState(struct {
-		Version int                         `json:"version"`
-		Offsets map[string]model.Checkpoint `json:"offsets"`
-	}{Version: stateVersion, Offsets: offsets})
+	// Validate before the comparison: the in-memory view is by construction
+	// what a reload of the file would produce, so comparing anything else
+	// would make the dirty check lie.
+	clean := s.validOffsets(offsets, "SaveOffsets")
+	if s.offsetsOnDisk && maps.Equal(s.offsets, clean) {
+		return nil
+	}
+	data, err := marshalState(offsetsFile{
+		envelope: envelope{Version: stateVersion},
+		Offsets:  clean,
+	})
 	if err != nil {
 		return fmt.Errorf("store: encode %s: %w", OffsetsFile, err)
 	}
 	if err := s.writeFile(s.dir, OffsetsFile, data); err != nil {
-		return fmt.Errorf("store: save %s: %w: %w", OffsetsFile, ErrNotPersisted, err)
+		return saveError(OffsetsFile, err)
 	}
 	// Only adopt the new view once it is durable, so a failed write does not
 	// make Lookup lie about what a restart would see.
-	s.setOffsetsLocked(offsets)
+	s.setOffsetsLocked(clean)
+	s.offsetsOnDisk = true
 	return nil
 }
 
@@ -383,9 +427,15 @@ func (s *Store) SaveOffsets(offsets map[string]model.Checkpoint) error {
 // monitors watching one log is a normal configuration — the one with the
 // largest Offset wins, deterministically, because re-reading a little is
 // cheaper than skipping lines.
+//
+// A closed Store reports nothing found: it no longer owns the directory, so
+// whatever it remembers may already have been superseded by another daemon.
 func (s *Store) Lookup(path string) (model.Checkpoint, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed {
+		return model.Checkpoint{}, false
+	}
 	if cp, ok := s.offsets[path]; ok && (cp.Path == "" || cp.Path == path) {
 		return cp, true
 	}
@@ -393,15 +443,54 @@ func (s *Store) Lookup(path string) (model.Checkpoint, bool) {
 	return cp, ok
 }
 
+// armTimerLocked schedules the debounced write and stamps the callback with a
+// generation token.
+//
+// The token is what makes cancellation reliable. Stop reports false for a
+// timer that has already fired and is blocked on the mutex, so a Flush can
+// believe it cancelled a timer that is in fact about to run; if that zombie
+// callback then wrote, it would both break the one-write-per-interval
+// contract and overwrite s.timer, orphaning the timer armed in the meantime.
+// A callback whose token no longer matches simply does nothing.
+func (s *Store) armTimerLocked(wait time.Duration) {
+	s.gen++
+	gen := s.gen
+	s.timer = s.after(wait, func() { s.onTimer(gen) })
+}
+
+// cancelTimerLocked stops the debounce timer and invalidates its callback.
+// The generation bump is the part that matters: Stop cannot recall a callback
+// that is already waiting for the mutex.
+func (s *Store) cancelTimerLocked() {
+	if s.timer != nil {
+		s.timer.Stop()
+		s.timer = nil
+	}
+	s.gen++
+}
+
 // onTimer runs the debounced write and, on failure, schedules a bounded
 // backoff chain so that a transient disk problem does not pin the newest
 // bans in memory until the next save (which on a quiet daemon may never
 // come — and a quiet daemon is exactly when the last ban matters).
-func (s *Store) onTimer() {
+func (s *Store) onTimer(gen uint64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if gen != s.gen {
+		// Superseded while this callback waited for the mutex. Touching
+		// s.timer here would discard whoever superseded us.
+		return
+	}
 	s.timer = nil
-	if s.closed {
+	if s.closed || !s.hasPending {
+		return
+	}
+	// The scheduler alone cannot enforce "at most one write per interval":
+	// this timer may have been armed before the write that just happened.
+	// Re-arm for the remainder instead of writing early, so the rate limit
+	// holds no matter how the timers were scheduled.
+	if wait := s.interval - s.now().Sub(s.lastBanAt); wait > 0 {
+		s.armTimerLocked(wait)
 		return
 	}
 	err := s.writeBansLocked()
@@ -421,14 +510,11 @@ func (s *Store) onTimer() {
 		delay = maxRetryDelay
 	}
 	s.log.Warn("ban write failed; retrying", "attempt", s.retries, "retry_in", delay, "error", err)
-	s.timer = s.after(delay, s.onTimer)
+	s.armTimerLocked(delay)
 }
 
 func (s *Store) flushLocked() error {
-	if s.timer != nil {
-		s.timer.Stop()
-		s.timer = nil
-	}
+	s.cancelTimerLocked()
 	if err := s.writeBansLocked(); err != nil {
 		s.deferredErr = err // sticky: every later Close/Flush sees it again
 		return err
@@ -450,15 +536,15 @@ func (s *Store) writeBansLocked() error {
 	if bans == nil {
 		bans = []model.Ban{} // encode as [], not null
 	}
-	data, err := marshalState(struct {
-		Version int         `json:"version"`
-		Bans    []model.Ban `json:"bans"`
-	}{Version: stateVersion, Bans: bans})
+	data, err := marshalState(bansFile{
+		envelope: envelope{Version: stateVersion},
+		Bans:     bans,
+	})
 	if err != nil {
 		return fmt.Errorf("store: encode %s: %w: %w", BansFile, ErrNotPersisted, err)
 	}
 	if err := s.writeFile(s.dir, BansFile, data); err != nil {
-		return fmt.Errorf("store: save %s: %w: %w", BansFile, ErrNotPersisted, err)
+		return saveError(BansFile, err)
 	}
 	s.hasPending = false
 	s.lastBanAt = s.now()
@@ -469,6 +555,97 @@ func (s *Store) writeBansLocked() error {
 		s.deferredErr = nil
 	}
 	return nil
+}
+
+// saveError classifies a failed state write. A write that never reached the
+// file leaves the state only in memory, which is what ErrNotPersisted
+// promises; a rename that landed but whose directory fsync failed is already
+// visible to the next reader, so labelling it "not persisted" would tell the
+// shutdown path to protect data that is in fact on disk.
+func saveError(base string, err error) error {
+	if errors.Is(err, ErrNotDurable) {
+		return fmt.Errorf("store: save %s: %w", base, err)
+	}
+	return fmt.Errorf("store: save %s: %w: %w", base, ErrNotPersisted, err)
+}
+
+// deferredFailure labels an error that belongs to an earlier debounced write.
+// Without the label the caller cannot tell it from a failure of the call it
+// just made — and the state it just handed over is fine, safely in memory and
+// queued for the next write.
+func deferredFailure(err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("store: an earlier debounced %s write failed: %w", BansFile, err)
+}
+
+// validBans drops the entries the load path refuses, so that both paths agree
+// on what a valid ban is. Asymmetric validation would let a store hand out,
+// within one run, exactly the value a restart silently discards.
+//
+// Individual junk entries are dropped rather than the whole file: one broken
+// line must not cost every other ban. This package is the quarantine
+// boundary; downstream code should not have to defend itself against values
+// that cannot occur.
+//
+// The result is always a fresh slice, never aliasing the input.
+func (s *Store) validBans(bans []model.Ban, origin string) []model.Ban {
+	kept := bans[:0:0]
+	var invalid, backwards int
+	sample := ""
+	for i, b := range bans {
+		switch {
+		case !b.IP.IsValid():
+			invalid++
+			if sample == "" {
+				sample = fmt.Sprintf("entry %d has an invalid address", i)
+			}
+		case b.Until.Before(b.At):
+			backwards++
+			if sample == "" {
+				sample = fmt.Sprintf("entry %d (%s) expires %s, before it started %s",
+					i, b.IP, b.Until.Format(time.RFC3339), b.At.Format(time.RFC3339))
+			}
+		default:
+			kept = append(kept, b)
+		}
+	}
+	if dropped := invalid + backwards; dropped > 0 {
+		// One line with a count, not one line per entry: a corrupt file with
+		// 50k bad entries must not turn startup into 50k log lines
+		// (PROJECT.md §4.9 asks for rate-limited repeated errors).
+		s.log.Warn("dropped unusable ban entries", "origin", origin,
+			"dropped", dropped, "kept", len(kept),
+			"invalid_address", invalid, "expires_before_start", backwards,
+			"example", sample)
+	}
+	return kept
+}
+
+// validOffsets is validBans' counterpart for checkpoints: a negative offset
+// would make a source seek backwards forever, and rewinding to the start of
+// the file is the safe reading. The result is always a fresh, non-nil map, so
+// an empty save renders as {} rather than null.
+func (s *Store) validOffsets(offsets map[string]model.Checkpoint, origin string) map[string]model.Checkpoint {
+	out := make(map[string]model.Checkpoint, len(offsets))
+	clamped := 0
+	sample := ""
+	for k, cp := range offsets {
+		if cp.Offset < 0 {
+			clamped++
+			if sample == "" || k < sample { // map order must not pick the example
+				sample = k
+			}
+			cp.Offset = 0
+		}
+		out[k] = cp
+	}
+	if clamped > 0 {
+		s.log.Warn("clamped negative checkpoint offsets to 0", "origin", origin,
+			"clamped", clamped, "example_key", sample)
+	}
+	return out
 }
 
 func (s *Store) setOffsets(offsets map[string]model.Checkpoint) {
@@ -486,6 +663,10 @@ func (s *Store) setOffsetsLocked(offsets map[string]model.Checkpoint) {
 		s.offsets = make(map[string]model.Checkpoint)
 	}
 	s.byPath = make(map[string]model.Checkpoint, len(offsets))
+
+	var clashed []string                // paths named more than once, in key order
+	winner := make(map[string]string)   // path -> key of the entry we kept
+	discarded := make(map[string]int64) // the furthest offset we did not take
 	for _, k := range slices.Sorted(maps.Keys(offsets)) {
 		v := offsets[k]
 		key := v.Path
@@ -495,37 +676,84 @@ func (s *Store) setOffsetsLocked(offsets map[string]model.Checkpoint) {
 			key = k
 		}
 		prev, clash := s.byPath[key]
-		if clash {
-			s.log.Warn("several checkpoints name the same file; resuming from the furthest one",
-				"path", key, "offsets", []int64{prev.Offset, v.Offset})
-			if v.Offset <= prev.Offset {
-				continue
-			}
+		if !clash {
+			s.byPath[key] = v
+			winner[key] = k
+			continue
 		}
-		s.byPath[key] = v
+		if _, seen := discarded[key]; !seen {
+			clashed = append(clashed, key)
+		}
+		loser := v
+		if v.Offset > prev.Offset {
+			s.byPath[key] = v
+			winner[key] = k
+			loser = prev
+		}
+		discarded[key] = max(discarded[key], loser.Offset)
 	}
+	s.reportClashesLocked(clashed, winner, discarded)
 }
 
-func (s *Store) loadOffsetsFromDisk() (map[string]model.Checkpoint, error) {
-	var file struct {
-		Version int                         `json:"version"`
-		Offsets map[string]model.Checkpoint `json:"offsets"`
-	}
-	ok, err := s.readState(OffsetsFile, &file, func() int { return file.Version })
-	if err != nil || !ok {
-		return nil, err
-	}
-	for k, cp := range file.Offsets {
-		// A negative offset would make a source seek backwards forever;
-		// rewinding to the start of the file is the safe reading.
-		if cp.Offset < 0 {
-			s.log.Warn("clamping negative checkpoint offset to 0",
-				"file", OffsetsFile, "key", k, "offset", cp.Offset)
-			cp.Offset = 0
-			file.Offsets[k] = cp
+// reportClashesLocked warns about paths named by more than one checkpoint —
+// once per path, and again only if a different entry starts winning. Two
+// monitors on one log file is a legitimate configuration whose offsets both
+// advance, and the daemon rebuilds this index on every SaveOffsets (every 5s):
+// warning per rebuild, or even per change of offset, would fill the log
+// forever. PROJECT.md §4.9 asks for repeated errors to be rate-limited.
+func (s *Store) reportClashesLocked(clashed []string, winner map[string]string, discarded map[string]int64) {
+	for _, path := range clashed {
+		if last, warned := s.clashWarned[path]; warned && last == winner[path] {
+			continue // same clash, same answer: nothing new to tell the operator
 		}
+		s.clashWarned[path] = winner[path]
+		// Separate keys for the two offsets: a single list left the reader
+		// guessing which of the numbers was actually used. Naming the winner
+		// also keeps the message true on the branch that drops the candidate.
+		s.log.Warn("several checkpoints name the same file; resuming from the furthest one",
+			"path", path, "kept_key", winner[path],
+			"kept_offset", s.byPath[path].Offset, "discarded_offset", discarded[path])
 	}
-	return file.Offsets, nil
+	// Forget paths that no longer clash, so the map cannot grow without bound
+	// and a recurrence is reported again.
+	maps.DeleteFunc(s.clashWarned, func(path string, _ string) bool {
+		return !slices.Contains(clashed, path)
+	})
+}
+
+// loadOffsetsFromDisk reads offsets.json. The second result reports whether
+// the file was actually there and usable, which is what tells SaveOffsets
+// that skipping an unchanged write is safe.
+func (s *Store) loadOffsetsFromDisk() (map[string]model.Checkpoint, bool, error) {
+	var file offsetsFile
+	ok, err := s.readState(OffsetsFile, &file)
+	if err != nil || !ok {
+		return nil, false, err
+	}
+	return s.validOffsets(file.Offsets, OffsetsFile), true, nil
+}
+
+// envelope is the head both state files share: the version tag readState
+// checks. Declaring it once means readState can do that check itself instead
+// of every caller repeating an anonymous struct and a closure to reach its
+// own Version field.
+type envelope struct {
+	Version int `json:"version"`
+}
+
+func (e envelope) fileVersion() int { return e.Version }
+
+// versioned is what readState needs of a decode target.
+type versioned interface{ fileVersion() int }
+
+type bansFile struct {
+	envelope
+	Bans []model.Ban `json:"bans"`
+}
+
+type offsetsFile struct {
+	envelope
+	Offsets map[string]model.Checkpoint `json:"offsets"`
 }
 
 // readState reads and decodes a state file. It reports ok=false (with a nil
@@ -533,7 +761,7 @@ func (s *Store) loadOffsetsFromDisk() (map[string]model.Checkpoint, error) {
 // unknown version; in the latter four cases the file is quarantined first. A
 // non-nil error means the directory itself is unusable, which the caller
 // should treat as fatal.
-func (s *Store) readState(base string, dst any, version func() int) (bool, error) {
+func (s *Store) readState(base string, dst versioned) (bool, error) {
 	path := filepath.Join(s.dir, base)
 	data, err := s.readCapped(path)
 	switch {
@@ -553,7 +781,7 @@ func (s *Store) readState(base string, dst any, version func() int) (bool, error
 		s.quarantine(base, err)
 		return false, nil
 	}
-	if v := version(); v != stateVersion {
+	if v := dst.fileVersion(); v != stateVersion {
 		s.quarantine(base, fmt.Errorf("unsupported state version %d (want %d)", v, stateVersion))
 		return false, nil
 	}

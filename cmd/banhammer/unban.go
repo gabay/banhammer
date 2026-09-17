@@ -17,7 +17,10 @@ func newUnbanCmd(root *rootFlags) *cobra.Command {
 		Short: "Manually unban an IP address or all active bans",
 		Long:  "Unban removes an active firewall drop rule for the specified IP address, or lifts all active bans when --all is supplied.",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			socketPath := resolveSocketPath(root.socket, root.config)
+			socketPath, err := resolveSocketPath(root.socket, root.config)
+			if err != nil {
+				return err
+			}
 			client := control.NewClient(socketPath)
 
 			if all {

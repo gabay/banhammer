@@ -40,8 +40,8 @@ func TestCounters(t *testing.T) {
 			name: "lines_read increments and totals",
 			run: func(t *testing.T, reg *Registry) {
 				reg.IncLinesRead("sshd")
-				reg.AddLinesRead("sshd", 9)
-				reg.AddLinesRead("nginx", 5)
+				reg.linesRead.add("sshd", 9)
+				reg.linesRead.add("nginx", 5)
 
 				if got, want := reg.LinesRead("sshd"), int64(10); got != want {
 					t.Errorf("LinesRead(sshd) = %d, want %d", got, want)
@@ -61,10 +61,10 @@ func TestCounters(t *testing.T) {
 			name: "lines_dropped per-monitor and global",
 			run: func(t *testing.T, reg *Registry) {
 				reg.IncLinesDropped("sshd")
-				reg.AddLinesDropped("sshd", 2)
+				reg.linesDropped.add("sshd", 2)
 				reg.IncLinesDropped("") // normalized to global
-				reg.IncGlobalLinesDropped()
-				reg.AddGlobalLinesDropped(3)
+				reg.linesDropped.inc("global")
+				reg.linesDropped.add("global", 3)
 
 				if got, want := reg.LinesDropped("sshd"), int64(3); got != want {
 					t.Errorf("LinesDropped(sshd) = %d, want %d", got, want)
@@ -84,8 +84,8 @@ func TestCounters(t *testing.T) {
 			name: "matches increments and totals",
 			run: func(t *testing.T, reg *Registry) {
 				reg.IncMatches("sshd")
-				reg.AddMatches("sshd", 4)
-				reg.AddMatches("caddy", 3)
+				reg.matches.add("sshd", 4)
+				reg.matches.add("caddy", 3)
 
 				if got, want := reg.Matches("sshd"), int64(5); got != want {
 					t.Errorf("Matches(sshd) = %d, want %d", got, want)
@@ -101,12 +101,12 @@ func TestCounters(t *testing.T) {
 		{
 			name: "bans and unbans increments and totals",
 			run: func(t *testing.T, reg *Registry) {
-				reg.IncBans("sshd")
-				reg.AddBans("sshd", 2)
-				reg.IncUnbans("sshd")
+				reg.bans.inc("sshd")
+				reg.bans.add("sshd", 2)
+				reg.unbans.inc("sshd")
 
-				reg.AddBans("postfix", 4)
-				reg.AddUnbans("postfix", 3)
+				reg.bans.add("postfix", 4)
+				reg.unbans.add("postfix", 3)
 
 				if got, want := reg.Bans("sshd"), int64(3); got != want {
 					t.Errorf("Bans(sshd) = %d, want %d", got, want)
@@ -126,7 +126,7 @@ func TestCounters(t *testing.T) {
 			name: "action_errors increments and totals",
 			run: func(t *testing.T, reg *Registry) {
 				reg.IncActionErrors("iptables")
-				reg.AddActionErrors("iptables", 2)
+				reg.actionErrors.add("iptables", 2)
 				reg.IncActionErrors("nft")
 				reg.IncActionErrors("") // normalized to unknown
 
@@ -148,7 +148,7 @@ func TestCounters(t *testing.T) {
 			name: "decode_errors increments and totals",
 			run: func(t *testing.T, reg *Registry) {
 				reg.IncDecodeErrors("json_api")
-				reg.AddDecodeErrors("json_api", 6)
+				reg.decodeErrors.add("json_api", 6)
 				reg.IncDecodeErrors("caddy")
 
 				if got, want := reg.DecodeErrors("json_api"), int64(7); got != want {
@@ -176,9 +176,9 @@ func TestGauges(t *testing.T) {
 	t.Run("tracked_ips gauge updates", func(t *testing.T) {
 		reg := New()
 		reg.SetTrackedIPs("sshd", 10)
-		reg.IncTrackedIPs("sshd")
-		reg.DecTrackedIPs("sshd")
-		reg.IncTrackedIPs("sshd")
+		reg.trackedIPs.add("sshd", 1)
+		reg.trackedIPs.add("sshd", -1)
+		reg.trackedIPs.add("sshd", 1)
 
 		reg.SetTrackedIPs("nginx", 5)
 
@@ -196,8 +196,8 @@ func TestGauges(t *testing.T) {
 	t.Run("active_bans gauge updates", func(t *testing.T) {
 		reg := New()
 		reg.SetActiveBans("sshd", 3)
-		reg.IncActiveBans("sshd")
-		reg.DecActiveBans("sshd")
+		reg.activeBans.add("sshd", 1)
+		reg.activeBans.add("sshd", -1)
 
 		reg.SetActiveBans("caddy", 2)
 
@@ -238,15 +238,23 @@ func TestGauges(t *testing.T) {
 			t.Errorf("UptimeSeconds after 43.5s = %f, want %f", got, want)
 		}
 
-		// Test SetClock and SetStartTime setters
+		// WithStartTime lets uptime be measured from process start rather than
+		// from registry construction; a start time in the future (a clock step
+		// between the two) must not be clamped away silently.
 		t1 := t0.Add(100 * time.Second)
-		reg.SetStartTime(t1)
-		if got := reg.UptimeSeconds(); got >= 0 {
+		future := NewRegistry(
+			WithStartTime(t1),
+			WithClock(func() time.Time { return t0 }),
+		)
+		if got := future.UptimeSeconds(); got >= 0 {
 			t.Errorf("UptimeSeconds with future start time = %f, want negative", got)
 		}
-		reg.SetClock(func() time.Time { return t1.Add(10 * time.Second) })
-		if got, want := reg.UptimeSeconds(), 10.0; got != want {
-			t.Errorf("UptimeSeconds after SetClock = %f, want %f", got, want)
+		ticking := NewRegistry(
+			WithStartTime(t1),
+			WithClock(func() time.Time { return t1.Add(10 * time.Second) }),
+		)
+		if got, want := ticking.UptimeSeconds(), 10.0; got != want {
+			t.Errorf("UptimeSeconds = %f, want %f", got, want)
 		}
 	})
 }
@@ -254,19 +262,19 @@ func TestGauges(t *testing.T) {
 func TestControlStats(t *testing.T) {
 	reg := NewRegistry()
 
-	reg.AddLinesRead("sshd", 100)
-	reg.AddLinesRead("caddy", 50)
-	reg.AddLinesDropped("sshd", 3)
-	reg.AddGlobalLinesDropped(7)
-	reg.AddMatches("sshd", 20)
-	reg.AddMatches("caddy", 10)
-	reg.AddBans("sshd", 5)
-	reg.AddBans("caddy", 2)
-	reg.AddUnbans("sshd", 3)
-	reg.AddUnbans("caddy", 1)
-	reg.AddActionErrors("iptables", 2)
-	reg.AddActionErrors("nft", 1)
-	reg.AddDecodeErrors("caddy", 4)
+	reg.linesRead.add("sshd", 100)
+	reg.linesRead.add("caddy", 50)
+	reg.linesDropped.add("sshd", 3)
+	reg.linesDropped.add("global", 7)
+	reg.matches.add("sshd", 20)
+	reg.matches.add("caddy", 10)
+	reg.bans.add("sshd", 5)
+	reg.bans.add("caddy", 2)
+	reg.unbans.add("sshd", 3)
+	reg.unbans.add("caddy", 1)
+	reg.actionErrors.add("iptables", 2)
+	reg.actionErrors.add("nft", 1)
+	reg.decodeErrors.add("caddy", 4)
 
 	want := control.Stats{
 		LinesRead:    150,
@@ -283,7 +291,7 @@ func TestControlStats(t *testing.T) {
 		t.Fatalf("Stats() mismatch:\ngot:  %+v\nwant: %+v", got, want)
 	}
 
-	gotSnapshot := reg.SnapshotStats()
+	gotSnapshot := reg.Stats()
 	if gotSnapshot != want {
 		t.Fatalf("SnapshotStats() mismatch:\ngot:  %+v\nwant: %+v", gotSnapshot, want)
 	}
@@ -306,15 +314,15 @@ func TestInitMonitorAndBackend(t *testing.T) {
 
 	prom := reg.FormatPrometheus()
 	expectedSubstrings := []string{
-		`lines_read{monitor="auth"} 0`,
-		`lines_dropped{monitor="auth"} 0`,
-		`matches{monitor="auth"} 0`,
-		`bans{monitor="auth"} 0`,
-		`unbans{monitor="auth"} 0`,
-		`decode_errors{monitor="auth"} 0`,
-		`tracked_ips{monitor="auth"} 0`,
-		`active_bans{monitor="auth"} 0`,
-		`action_errors{backend="nft"} 0`,
+		`banhammer_lines_read_total{monitor="auth"} 0`,
+		`banhammer_lines_dropped_total{monitor="auth"} 0`,
+		`banhammer_matches_total{monitor="auth"} 0`,
+		`banhammer_bans_total{monitor="auth"} 0`,
+		`banhammer_unbans_total{monitor="auth"} 0`,
+		`banhammer_decode_errors_total{monitor="auth"} 0`,
+		`banhammer_tracked_ips{monitor="auth"} 0`,
+		`banhammer_active_bans{monitor="auth"} 0`,
+		`banhammer_action_errors_total{backend="nft"} 0`,
 	}
 	for _, sub := range expectedSubstrings {
 		if !strings.Contains(prom, sub) {
@@ -325,9 +333,9 @@ func TestInitMonitorAndBackend(t *testing.T) {
 
 func TestReset(t *testing.T) {
 	reg := NewRegistry()
-	reg.AddLinesRead("sshd", 10)
+	reg.linesRead.add("sshd", 10)
 	reg.SetTrackedIPs("sshd", 5)
-	reg.AddActionErrors("iptables", 2)
+	reg.actionErrors.add("iptables", 2)
 
 	if reg.TotalLinesRead() != 10 {
 		t.Fatalf("expected TotalLinesRead == 10")
@@ -355,60 +363,60 @@ func TestPrometheusFormat(t *testing.T) {
 
 	reg := NewRegistry(WithClock(clock), WithStartTime(t0))
 
-	reg.AddLinesRead("sshd", 100)
-	reg.AddLinesDropped("sshd", 2)
-	reg.AddGlobalLinesDropped(3)
-	reg.AddMatches("sshd", 20)
-	reg.AddBans("sshd", 5)
-	reg.AddUnbans("sshd", 3)
-	reg.AddActionErrors("iptables", 1)
-	reg.AddDecodeErrors("sshd", 4)
+	reg.linesRead.add("sshd", 100)
+	reg.linesDropped.add("sshd", 2)
+	reg.linesDropped.add("global", 3)
+	reg.matches.add("sshd", 20)
+	reg.bans.add("sshd", 5)
+	reg.unbans.add("sshd", 3)
+	reg.actionErrors.add("iptables", 1)
+	reg.decodeErrors.add("sshd", 4)
 	reg.SetTrackedIPs("sshd", 12)
 	reg.SetActiveBans("sshd", 2)
 
 	out := reg.FormatPrometheus()
 
 	expectedLines := []string{
-		"# HELP lines_read Total number of log lines read from sources.",
-		"# TYPE lines_read counter",
-		`lines_read{monitor="sshd"} 100`,
+		"# HELP banhammer_lines_read_total Total number of log lines read from sources.",
+		"# TYPE banhammer_lines_read_total counter",
+		`banhammer_lines_read_total{monitor="sshd"} 100`,
 
-		"# HELP lines_dropped Total number of log lines dropped due to queue saturation or buffer limits.",
-		"# TYPE lines_dropped counter",
-		`lines_dropped{monitor="global"} 3`,
-		`lines_dropped{monitor="sshd"} 2`,
+		"# HELP banhammer_lines_dropped_total Total number of log lines dropped due to queue saturation or buffer limits.",
+		"# TYPE banhammer_lines_dropped_total counter",
+		`banhammer_lines_dropped_total{monitor="global"} 3`,
+		`banhammer_lines_dropped_total{monitor="sshd"} 2`,
 
-		"# HELP matches Total number of log lines matching monitor attack patterns.",
-		"# TYPE matches counter",
-		`matches{monitor="sshd"} 20`,
+		"# HELP banhammer_matches_total Total number of log lines matching monitor attack patterns.",
+		"# TYPE banhammer_matches_total counter",
+		`banhammer_matches_total{monitor="sshd"} 20`,
 
-		"# HELP bans Total number of firewall ban actions executed.",
-		"# TYPE bans counter",
-		`bans{monitor="sshd"} 5`,
+		"# HELP banhammer_bans_total Total number of bans issued.",
+		"# TYPE banhammer_bans_total counter",
+		`banhammer_bans_total{monitor="sshd"} 5`,
 
-		"# HELP unbans Total number of firewall unban actions executed.",
-		"# TYPE unbans counter",
-		`unbans{monitor="sshd"} 3`,
+		"# HELP banhammer_unbans_total Total number of bans lifted, by expiry or by hand.",
+		"# TYPE banhammer_unbans_total counter",
+		`banhammer_unbans_total{monitor="sshd"} 3`,
 
-		"# HELP action_errors Total number of firewall action execution failures.",
-		"# TYPE action_errors counter",
-		`action_errors{backend="iptables"} 1`,
+		"# HELP banhammer_action_errors_total Total number of firewall action execution failures.",
+		"# TYPE banhammer_action_errors_total counter",
+		`banhammer_action_errors_total{backend="iptables"} 1`,
 
-		"# HELP decode_errors Total number of log decoding or JSON parsing failures.",
-		"# TYPE decode_errors counter",
-		`decode_errors{monitor="sshd"} 4`,
+		"# HELP banhammer_decode_errors_total Total number of log decoding or JSON parsing failures.",
+		"# TYPE banhammer_decode_errors_total counter",
+		`banhammer_decode_errors_total{monitor="sshd"} 4`,
 
-		"# HELP tracked_ips Current number of unique offending IP addresses tracked in memory.",
-		"# TYPE tracked_ips gauge",
-		`tracked_ips{monitor="sshd"} 12`,
+		"# HELP banhammer_tracked_ips Current number of unique offending IP addresses tracked in memory.",
+		"# TYPE banhammer_tracked_ips gauge",
+		`banhammer_tracked_ips{monitor="sshd"} 12`,
 
-		"# HELP active_bans Current number of active firewall IP bans in effect.",
-		"# TYPE active_bans gauge",
-		`active_bans{monitor="sshd"} 2`,
+		"# HELP banhammer_active_bans Current number of active firewall IP bans in effect.",
+		"# TYPE banhammer_active_bans gauge",
+		`banhammer_active_bans{monitor="sshd"} 2`,
 
-		"# HELP uptime_seconds Total daemon uptime in seconds.",
-		"# TYPE uptime_seconds gauge",
-		"uptime_seconds 3600",
+		"# HELP banhammer_uptime_seconds Total daemon uptime in seconds.",
+		"# TYPE banhammer_uptime_seconds gauge",
+		"banhammer_uptime_seconds 3600",
 	}
 
 	for _, expected := range expectedLines {
@@ -424,7 +432,7 @@ func TestPrometheusEscaping(t *testing.T) {
 	reg.IncLinesRead(specialMonitor)
 
 	out := reg.FormatPrometheus()
-	expected := `lines_read{monitor="my\"monitor\\with\nnewline"} 1`
+	expected := `banhammer_lines_read_total{monitor="my\"monitor\\with\nnewline"} 1`
 	if !strings.Contains(out, expected) {
 		t.Fatalf("Prometheus escaping failed. Expected %q in output:\n%s", expected, out)
 	}
@@ -432,10 +440,10 @@ func TestPrometheusEscaping(t *testing.T) {
 
 func TestPrometheusSortedLabels(t *testing.T) {
 	reg := NewRegistry()
-	reg.AddLinesRead("zebra", 1)
-	reg.AddLinesRead("alpha", 2)
-	reg.AddLinesRead("charlie", 3)
-	reg.AddLinesRead("bravo", 4)
+	reg.linesRead.add("zebra", 1)
+	reg.linesRead.add("alpha", 2)
+	reg.linesRead.add("charlie", 3)
+	reg.linesRead.add("bravo", 4)
 
 	out := reg.FormatPrometheus()
 
@@ -453,18 +461,24 @@ func TestWithPrefix(t *testing.T) {
 	t0 := time.Date(2026, 9, 15, 0, 0, 0, 0, time.UTC)
 	clock, _ := newTestClock(t0.Add(60 * time.Second))
 
-	reg := NewRegistry(WithPrefix("banhammer_"), WithClock(clock), WithStartTime(t0))
+	// A prefix other than the default proves the option is honoured rather
+	// than the default leaking through.
+	reg := NewRegistry(WithPrefix("acme_"), WithClock(clock), WithStartTime(t0))
 	reg.IncLinesRead("sshd")
 
 	out := reg.FormatPrometheus()
 
 	expectedSubstrings := []string{
-		"# HELP banhammer_lines_read",
-		"# TYPE banhammer_lines_read counter",
-		`banhammer_lines_read{monitor="sshd"} 1`,
-		"# HELP banhammer_uptime_seconds",
-		"# TYPE banhammer_uptime_seconds gauge",
-		"banhammer_uptime_seconds 60",
+		"# HELP acme_lines_read_total",
+		"# TYPE acme_lines_read_total counter",
+		`acme_lines_read_total{monitor="sshd"} 1`,
+		"# HELP acme_uptime_seconds",
+		"# TYPE acme_uptime_seconds gauge",
+		"acme_uptime_seconds 60",
+	}
+
+	if strings.Contains(out, DefaultPrefix) {
+		t.Errorf("output still carries the default prefix %q:\n%s", DefaultPrefix, out)
 	}
 
 	for _, sub := range expectedSubstrings {
@@ -492,10 +506,10 @@ func TestHttpHandler(t *testing.T) {
 			target:     "/metrics",
 			wantStatus: http.StatusOK,
 			checkBody: func(t *testing.T, body string) {
-				if !strings.Contains(body, `lines_read{monitor="sshd"} 1`) {
+				if !strings.Contains(body, `banhammer_lines_read_total{monitor="sshd"} 1`) {
 					t.Errorf("missing lines_read metric in body: %s", body)
 				}
-				if !strings.Contains(body, "uptime_seconds") {
+				if !strings.Contains(body, "banhammer_uptime_seconds") {
 					t.Errorf("missing uptime_seconds metric in body: %s", body)
 				}
 			},
@@ -581,12 +595,12 @@ func TestConcurrentSafety(t *testing.T) {
 				reg.IncLinesRead(mon)
 				reg.IncLinesDropped(mon)
 				reg.IncMatches(mon)
-				reg.IncBans(mon)
-				reg.IncUnbans(mon)
+				reg.bans.inc(mon)
+				reg.unbans.inc(mon)
 				reg.IncActionErrors(be)
 				reg.IncDecodeErrors(mon)
-				reg.IncTrackedIPs(mon)
-				reg.IncActiveBans(mon)
+				reg.trackedIPs.add(mon, 1)
+				reg.activeBans.add(mon, 1)
 			}
 		}(w)
 	}
@@ -669,7 +683,7 @@ func TestServerLifecycle(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("GET /metrics status = %d, want 200", resp.StatusCode)
 	}
-	if !strings.Contains(string(body), `lines_read{monitor="sshd"} 1`) {
+	if !strings.Contains(string(body), `banhammer_lines_read_total{monitor="sshd"} 1`) {
 		t.Errorf("GET /metrics body missing metric:\n%s", string(body))
 	}
 
@@ -845,5 +859,128 @@ func TestServerClose(t *testing.T) {
 
 	if err := srv.Close(); err != nil {
 		t.Errorf("Close() error = %v", err)
+	}
+}
+
+// TestCollectHook pins the pull model: the registry must ask its owner for the
+// ban counters at read time, because pushing them on every state change is
+// exactly what the ban manager cannot do without holding its lock across an
+// unknown callback.
+func TestCollectHook(t *testing.T) {
+	tests := []struct {
+		name string
+		read func(r *Registry)
+	}{
+		{"FormatPrometheus", func(r *Registry) { _ = r.FormatPrometheus() }},
+		{"Stats", func(r *Registry) { _ = r.Stats() }},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			reg := NewRegistry()
+			calls := 0
+			reg.Collect(func() {
+				calls++
+				reg.SetBans("sshd", int64(7+calls))
+			})
+
+			// Read the raw cell, not the Bans accessor: the accessor collects
+			// too, which would mask whether tc.read did.
+			if got := reg.bans.get("sshd"); got != 0 {
+				t.Fatalf("bans before any read = %d, want 0 (hook must not run on registration)", got)
+			}
+
+			tc.read(reg)
+			if calls != 1 {
+				t.Errorf("collect hook ran %d times, want 1", calls)
+			}
+			if got := reg.bans.get("sshd"); got != 8 {
+				t.Errorf("bans after read = %d, want 8", got)
+			}
+
+			tc.read(reg)
+			if calls != 2 {
+				t.Errorf("collect hook ran %d times after second read, want 2", calls)
+			}
+			if got := reg.bans.get("sshd"); got != 9 {
+				t.Errorf("bans after second read = %d, want 9 (hook result must not be cached)", got)
+			}
+		})
+	}
+}
+
+func TestSetBansAndUnbansAreAbsolute(t *testing.T) {
+	reg := NewRegistry()
+
+	reg.SetBans("sshd", 5)
+	reg.SetBans("sshd", 3) // a lower total must win: the setter is authoritative.
+	reg.SetUnbans("sshd", 2)
+	reg.SetBans("nginx", 4)
+
+	if got := reg.Bans("sshd"); got != 3 {
+		t.Errorf("Bans(sshd) = %d, want 3", got)
+	}
+	if got := reg.Unbans("sshd"); got != 2 {
+		t.Errorf("Unbans(sshd) = %d, want 2", got)
+	}
+	if got := reg.TotalBans(); got != 7 {
+		t.Errorf("TotalBans() = %d, want 7", got)
+	}
+	if got := reg.TotalUnbans(); got != 2 {
+		t.Errorf("TotalUnbans() = %d, want 2", got)
+	}
+}
+
+func TestWithPrefixRejectsInvalidPrefix(t *testing.T) {
+	// An invalid prefix would produce output Prometheus refuses to scrape, so
+	// it is ignored in favour of the default rather than silently corrupting
+	// the endpoint.
+	tests := []struct {
+		name   string
+		prefix string
+		want   string
+	}{
+		{"leading digit", "9bad_", DefaultPrefix},
+		{"dash", "ba-d_", DefaultPrefix},
+		{"space", "bad ", DefaultPrefix},
+		{"empty means unprefixed", "", ""},
+		{"valid colon", "bh:", "bh:"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			reg := NewRegistry(WithPrefix(tc.prefix))
+			if got := reg.getPrefix(); got != tc.want {
+				t.Errorf("getPrefix() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestCollectHookRunsOnAccessors pins that the ban accessors are pull-based
+// too. daemon_test's end-to-end assertions read Bans() directly, and a getter
+// that skipped the hook would report 0 for a ban that had definitely happened.
+func TestCollectHookRunsOnAccessors(t *testing.T) {
+	accessors := map[string]func(r *Registry) int64{
+		"Bans":            func(r *Registry) int64 { return r.Bans("sshd") },
+		"Unbans":          func(r *Registry) int64 { return r.Unbans("sshd") },
+		"ActiveBans":      func(r *Registry) int64 { return r.ActiveBans("sshd") },
+		"TotalBans":       (*Registry).TotalBans,
+		"TotalUnbans":     (*Registry).TotalUnbans,
+		"TotalActiveBans": (*Registry).TotalActiveBans,
+	}
+
+	for name, read := range accessors {
+		t.Run(name, func(t *testing.T) {
+			reg := NewRegistry()
+			reg.Collect(func() {
+				reg.SetBans("sshd", 3)
+				reg.SetUnbans("sshd", 3)
+				reg.SetActiveBans("sshd", 3)
+			})
+			if got := read(reg); got != 3 {
+				t.Errorf("%s() = %d, want 3 (accessor must run the collect hook)", name, got)
+			}
+		})
 	}
 }

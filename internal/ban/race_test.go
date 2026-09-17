@@ -37,7 +37,7 @@ func TestConcurrentAccess(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := range iterations {
-			m.Offend("sshd", netip.AddrFrom4([4]byte{10, 0, 0, byte(i % 16)}), i%7+1)
+			m.Offend("sshd", netip.AddrFrom4([4]byte{10, 0, 0, byte(i % 16)}), i%7+1, "")
 		}
 	}()
 
@@ -142,10 +142,10 @@ func BenchmarkOffendExisting(b *testing.B) {
 	})
 	m.SetPolicy("sshd", Policy{Bantime: time.Hour, FindHistory: 24 * time.Hour, Factor: 1})
 	ip := netip.MustParseAddr("198.51.100.1")
-	m.Offend("sshd", ip, 5)
+	m.Offend("sshd", ip, 5, "")
 
 	b.ReportAllocs()
 	for range b.N {
-		m.Offend("sshd", ip, 5)
+		m.Offend("sshd", ip, 5, "")
 	}
 }

@@ -15,11 +15,20 @@ import (
 // the xtables lock), and the Executor's retry is a better answer than waiting.
 const defaultTimeout = 10 * time.Second
 
+// DefaultChain is the firewall chain (or netfilter hook for nft) attached to
+// when Spec.Chain is empty.
+const DefaultChain = "INPUT"
+
 // Spec selects and configures a Backend. It is the action section of the
 // config, resolved for one monitor.
 type Spec struct {
 	// Name is one of iptables|ipset|nft|cmd|dryrun. Empty means iptables.
 	Name string
+
+	// Chain names the firewall chain (or netfilter hook for nft) to attach to
+	// (e.g. "INPUT" by default, or "DOCKER-USER" for Docker containers).
+	// Empty means DefaultChain ("INPUT").
+	Chain string
 
 	// Start, Ban, Unban and Stop are command templates for the cmd backend.
 	// Ban and Unban are required there; Start and Stop are optional.
@@ -28,12 +37,14 @@ type Spec struct {
 	// Shell runs cmd templates through "/bin/sh -c" instead of exec'ing them
 	// directly.
 	//
-	// This forfeits every injection guarantee this package otherwise provides:
-	// with Shell set, {matched} (and anything else attacker-influenced) is
-	// pasted into a string the shell will parse, so a crafted log line can run
-	// arbitrary commands as the daemon's user. It exists only because some
-	// templates genuinely need pipes or ';'. Prefer wrapping those in a script
-	// and calling the script.
+	// This forfeits the injection guarantee this package otherwise provides.
+	// Every substitution variable is currently trusted — {ip} is rendered from
+	// a parsed netip.Addr, {monitor} and {matched} come from the config — so
+	// the immediate risk is low, but the guarantee is structural and Shell
+	// removes it: the day a variable starts carrying log text, a crafted line
+	// runs arbitrary commands as the daemon's user. Shell exists only because
+	// some templates genuinely need pipes or ';'. Prefer wrapping those in a
+	// script and calling the script.
 	Shell bool
 
 	// Timeout bounds a single external command. Zero means defaultTimeout.
@@ -76,6 +87,12 @@ func New(spec Spec, r Runner, log *slog.Logger) (Backend, error) {
 	if spec.Timeout <= 0 {
 		spec.Timeout = defaultTimeout
 	}
+	chain := strings.TrimSpace(spec.Chain)
+	if chain == "" {
+		chain = DefaultChain
+	}
+	spec.Chain = chain
+
 	name := strings.ToLower(strings.TrimSpace(spec.Name))
 	if name == "" {
 		name = "iptables"
@@ -99,11 +116,11 @@ func New(spec Spec, r Runner, log *slog.Logger) (Backend, error) {
 	)
 	switch name {
 	case "iptables":
-		b = newIPTables(base)
+		b = newIPTables(base, chain)
 	case "ipset":
-		b = newIPSet(base)
+		b = newIPSet(base, chain)
 	case "nft":
-		b = newNFT(base)
+		b = newNFT(base, chain)
 	case "cmd":
 		b, err = newCmd(base, spec)
 	default:

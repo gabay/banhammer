@@ -374,3 +374,46 @@ func TestNFTBanUnban(t *testing.T) {
 		})
 	}
 }
+
+func TestIPSetCustomChain(t *testing.T) {
+	t.Parallel()
+	f := &fakeRunner{handler: cleanHost}
+	b, err := New(Spec{Name: "ipset", Chain: "DOCKER-USER"}, f, discardLogger())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := b.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	requireArgvSeq(t, f.argvs(), [][]string{
+		{"ipset", "-exist", "create", "banhammer4", "hash:ip", "family", "inet"},
+		{"iptables", "--wait", "-V"},
+		{"iptables", "--wait", "-t", "filter", "-C", "DOCKER-USER", "-m", "set", "--match-set", "banhammer4", "src", "-j", "DROP"},
+		{"iptables", "--wait", "-t", "filter", "-I", "DOCKER-USER", "-m", "set", "--match-set", "banhammer4", "src", "-j", "DROP"},
+		{"ipset", "-exist", "create", "banhammer6", "hash:ip", "family", "inet6"},
+		{"ip6tables", "--wait", "-V"},
+		{"ip6tables", "--wait", "-t", "filter", "-C", "DOCKER-USER", "-m", "set", "--match-set", "banhammer6", "src", "-j", "DROP"},
+		{"ip6tables", "--wait", "-t", "filter", "-I", "DOCKER-USER", "-m", "set", "--match-set", "banhammer6", "src", "-j", "DROP"},
+	})
+}
+
+func TestNFTCustomChain(t *testing.T) {
+	t.Parallel()
+	f := &fakeRunner{handler: func([]string, bool) ([]byte, error) { return nil, nil }}
+	b, err := New(Spec{Name: "nft", Chain: "FORWARD"}, f, discardLogger())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := b.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	requireArgvSeq(t, f.argvs(), [][]string{
+		{"nft", "add", "table", "inet", "banhammer"},
+		{"nft", "add", "set", "inet", "banhammer", "banhammer4", "{ type ipv4_addr; }"},
+		{"nft", "add", "set", "inet", "banhammer", "banhammer6", "{ type ipv6_addr; }"},
+		{"nft", "add", "chain", "inet", "banhammer", "forward", "{ type filter hook forward priority -10; policy accept; }"},
+		{"nft", "list", "chain", "inet", "banhammer", "forward"},
+		{"nft", "add", "rule", "inet", "banhammer", "forward", "ip", "saddr", "@banhammer4", "drop"},
+		{"nft", "add", "rule", "inet", "banhammer", "forward", "ip6", "saddr", "@banhammer6", "drop"},
+	})
+}

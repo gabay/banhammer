@@ -183,3 +183,12 @@ func TestStringShowsPatternsVerbatim(t *testing.T) {
 		t.Errorf("pattern not rendered verbatim:\n%s", c.String())
 	}
 }
+
+func TestStringShowsCustomChain(t *testing.T) {
+	t.Parallel()
+
+	c := mustParse(t, "monitors:\n  m:\n    stdin: true\n    match: \"<IP>\"\n    action:\n      chain: DOCKER-USER\n")
+	if !strings.Contains(c.String(), `action:         iptables (chain DOCKER-USER, timeout 10s)`) {
+		t.Errorf("custom chain not rendered:\n%s", c.String())
+	}
+}

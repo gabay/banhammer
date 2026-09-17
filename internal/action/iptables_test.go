@@ -330,3 +330,31 @@ type runnerFunc func(ctx context.Context, argv []string, shell bool) ([]byte, er
 func (fn runnerFunc) Run(ctx context.Context, argv []string, shell bool) ([]byte, error) {
 	return fn(ctx, argv, shell)
 }
+
+func TestIPTablesCustomChain(t *testing.T) {
+	t.Parallel()
+
+	f := &fakeRunner{handler: func(argv []string, _ bool) ([]byte, error) {
+		if hasArg(argv, "-C") {
+			return nil, exitErr(1, "iptables: Bad rule (does a matching rule exist in that chain?).")
+		}
+		return nil, nil
+	}}
+	b, err := New(Spec{Name: "iptables", Chain: "DOCKER-USER"}, f, discardLogger())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := b.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	requireArgvSeq(t, f.argvs(), [][]string{
+		{"iptables", "--wait", "-V"},
+		{"iptables", "--wait", "-t", "filter", "-N", "BANHAMMER"},
+		{"iptables", "--wait", "-t", "filter", "-C", "DOCKER-USER", "-j", "BANHAMMER"},
+		{"iptables", "--wait", "-t", "filter", "-I", "DOCKER-USER", "-j", "BANHAMMER"},
+		{"ip6tables", "--wait", "-V"},
+		{"ip6tables", "--wait", "-t", "filter", "-N", "BANHAMMER"},
+		{"ip6tables", "--wait", "-t", "filter", "-C", "DOCKER-USER", "-j", "BANHAMMER"},
+		{"ip6tables", "--wait", "-t", "filter", "-I", "DOCKER-USER", "-j", "BANHAMMER"},
+	})
+}

@@ -38,7 +38,13 @@ func newRunCmd(root *rootFlags) *cobra.Command {
 				return fmt.Errorf("load config %q: %w", cfgPath, err)
 			}
 
-			if stateDir != "" {
+			// config.Load has already validated cfg.StateDir; an override
+			// assigned after the fact skips that, so the one rule state_dir
+			// has (see internal/config/validate.go) is enforced here too.
+			if cmd.Flags().Changed("state-dir") {
+				if strings.TrimSpace(stateDir) == "" {
+					return errors.New("--state-dir must not be empty")
+				}
 				cfg.StateDir = stateDir
 			}
 
@@ -108,10 +114,11 @@ func newRunCmd(root *rootFlags) *cobra.Command {
 						switch sig {
 						case syscall.SIGHUP:
 							logger.Info("received SIGHUP, reloading configuration")
+							// Success is logged by daemon.Reload; saying it
+							// again here just doubles every reload in the
+							// journal.
 							if err := d.Reload(nil); err != nil {
 								logger.Error("configuration reload failed", "err", err)
-							} else {
-								logger.Info("configuration reloaded successfully")
 							}
 						case syscall.SIGINT, syscall.SIGTERM:
 							logger.Info("received shutdown signal", "signal", sig.String())

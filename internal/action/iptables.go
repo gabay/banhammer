@@ -38,9 +38,10 @@ var iptablesNotFound = []string{
 }
 
 // iptables is the default backend: a DROP rule per banned address in our own
-// chain, jumped to from INPUT.
+// chain, jumped to from chain (INPUT by default, or e.g. DOCKER-USER).
 type iptables struct {
 	base
+	chain string
 	// v4 and v6 are the per-family binaries plus whether they are usable.
 	v4, v6 *xtables
 }
@@ -54,21 +55,26 @@ type xtables struct {
 	setup bool
 }
 
-func newIPTables(b base) *iptables {
+func newIPTables(b base, chain string) *iptables {
+	if chain == "" {
+		chain = DefaultChain
+	}
 	return &iptables{
-		base: b,
-		v4:   &xtables{bin: binIPTables, fam: model.IPv4},
-		v6:   &xtables{bin: binIP6Tables, fam: model.IPv6},
+		base:  b,
+		chain: chain,
+		v4:    &xtables{bin: binIPTables, fam: model.IPv4},
+		v6:    &xtables{bin: binIP6Tables, fam: model.IPv6},
 	}
 }
 
 func (*iptables) Name() string { return "iptables" }
 
-// Start creates the chain and the INPUT jump for both families, idempotently.
+// Start creates the chain and the jump from t.chain for both families, idempotently.
 //
 // An IPv6 failure never fails startup: plenty of hosts have no ip6tables at
-// all, and refusing to protect IPv4 because of that would be a self-inflicted
-// outage. We log once and disable the v6 path instead.
+// all (or Docker's DOCKER-USER chain exists only in IPv4), and refusing to
+// protect IPv4 because of that would be a self-inflicted outage. We log once
+// and disable the v6 path instead.
 func (t *iptables) Start(ctx context.Context) error {
 	if err := t.setup(ctx, t.v4); err != nil {
 		return err
@@ -94,14 +100,14 @@ func (t *iptables) setup(ctx context.Context, x *xtables) error {
 
 	// -C is a question, not a command: a non-zero exit means "absent" and is
 	// expected control flow, so it must never be propagated as an error.
-	if _, err := t.exec(ctx, false, x.args("-t", "filter", "-C", "INPUT", "-j", chainName)...); err != nil {
+	if _, err := t.exec(ctx, false, x.args("-t", "filter", "-C", t.chain, "-j", chainName)...); err != nil {
 		if ExitCode(err) <= 0 {
-			return fmt.Errorf("checking INPUT jump via %s: %w", x.bin, err)
+			return fmt.Errorf("checking %s jump via %s: %w", t.chain, x.bin, err)
 		}
-		if _, err := t.exec(ctx, false, x.args("-t", "filter", "-I", "INPUT", "-j", chainName)...); err != nil {
-			return fmt.Errorf("inserting INPUT jump via %s: %w", x.bin, err)
+		if _, err := t.exec(ctx, false, x.args("-t", "filter", "-I", t.chain, "-j", chainName)...); err != nil {
+			return fmt.Errorf("inserting %s jump via %s: %w", t.chain, x.bin, err)
 		}
-		t.log.Info("installed INPUT jump", "binary", x.bin, "chain", chainName)
+		t.log.Info("installed chain jump", "binary", x.bin, "from", t.chain, "chain", chainName)
 	}
 
 	x.ok = true

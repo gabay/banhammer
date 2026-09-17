@@ -44,12 +44,12 @@ const (
 	// it: a non-address host yields OutcomeNoIP.
 	dnsPattern = `[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*`
 
-	// AddrPattern matches an IPv4 or IPv6 literal. IPv6 comes first so that
+	// addrPattern matches an IPv4 or IPv6 literal. IPv6 comes first so that
 	// the v4 tail of ::ffff:1.2.3.4 is not matched on its own.
-	AddrPattern = `(?:` + ipv6Pattern + `|` + ipv4Pattern + `)`
+	addrPattern = `(?:` + ipv6Pattern + `|` + ipv4Pattern + `)`
 
-	// HostPattern is AddrPattern plus DNS names, used by <HOST>.
-	HostPattern = `(?:` + ipv6Pattern + `|` + ipv4Pattern + `|` + dnsPattern + `)`
+	// hostPattern is addrPattern plus DNS names, used by <HOST>.
+	hostPattern = `(?:` + ipv6Pattern + `|` + ipv4Pattern + `|` + dnsPattern + `)`
 )
 
 // ipGroup is the capture group name every IP-bearing pattern must end up with,
@@ -61,25 +61,42 @@ const (
 	macroHost = "<HOST>"
 )
 
-// expandMacros rewrites <IP> and <HOST> into a named capture group and reports
-// how many macros it replaced.
+// expansion is what the macro scanner made of a pattern: the text to hand to
+// regexp.Compile, plus the two counts compilePattern needs to decide how to
+// treat the result.
+type expansion struct {
+	pattern string // macro-expanded, ready to compile
+	macros  int    // <IP>/<HOST> occurrences replaced
+	// ipGroups is how many capture groups named ipGroup the pattern ends up
+	// with, whether this scanner wrote them or the user did.
+	ipGroups int
+}
+
+// expandMacros rewrites <IP> and <HOST> into a named capture group.
 //
 // Expansion is textual but not blind: it tracks escapes and character classes,
 // because splicing a group into a class silently produces a regex that
 // compiles and matches the wrong thing (Go reads [<IP>] as the class of
 // '<','I','P','>'). A macro inside a class is therefore rejected outright. To
 // match the literal text "<IP>", escape the '<' as \x3c.
-func expandMacros(pattern string) (string, int, error) {
+//
+// Capture-group names are likewise copied through untouched: the '<' of
+// (?P<IP>...) opens a name, not a macro, and expanding it would splice a group
+// into the middle of the syntax and leave the user staring at "invalid or
+// unsupported Perl syntax: (?P".
+func expandMacros(pattern string) (expansion, error) {
+	// Both macros and capture-group names need a '<'; without one there is
+	// nothing to scan for.
 	if !strings.Contains(pattern, "<") {
-		return pattern, 0, nil
+		return expansion{pattern: pattern}, nil
 	}
 	var (
 		b        strings.Builder
-		count    int
+		exp      expansion
 		inClass  bool
 		classPos int // index just after '[' (and any '^'), where ']' is a literal
 	)
-	b.Grow(len(pattern) + len(AddrPattern))
+	b.Grow(len(pattern) + len(addrPattern))
 	for i := 0; i < len(pattern); {
 		c := pattern[i]
 		switch {
@@ -121,29 +138,76 @@ func expandMacros(pattern string) (string, int, error) {
 			b.WriteByte(c)
 			i++
 			continue
+		case !inClass && c == '(':
+			name, n := groupNameAt(pattern[i:])
+			if n == 0 {
+				break
+			}
+			if name == ipGroup {
+				exp.ipGroups++
+			}
+			b.WriteString(pattern[i : i+n])
+			i += n
+			continue
 		case c == '<':
-			var macro, expansion string
+			var macro, group string
 			switch {
 			case strings.HasPrefix(pattern[i:], macroIP):
-				macro, expansion = macroIP, AddrPattern
+				macro, group = macroIP, addrPattern
 			case strings.HasPrefix(pattern[i:], macroHost):
-				macro, expansion = macroHost, HostPattern
+				macro, group = macroHost, hostPattern
 			}
 			if macro == "" {
 				break
 			}
 			if inClass {
-				return "", 0, fmt.Errorf("%s inside a character class is not supported (escape the '<' as \\x3c to match it literally)", macro)
+				return expansion{}, fmt.Errorf("%s inside a character class is not supported (escape the '<' as \\x3c to match it literally)", macro)
 			}
-			b.WriteString(`(?P<` + ipGroup + `>` + expansion + `)`)
+			b.WriteString(`(?P<` + ipGroup + `>` + group + `)`)
 			i += len(macro)
-			count++
+			exp.macros++
+			exp.ipGroups++
 			continue
 		}
 		b.WriteByte(c)
 		i++
 	}
-	return b.String(), count, nil
+	exp.pattern = b.String()
+	return exp, nil
+}
+
+// groupNameAt reports the capture-group name opening s and the length of the
+// token that introduces it. Both spellings Go accepts are recognised: the
+// original (?P<name> and (?<name>, added in Go 1.22.
+//
+// A malformed name yields the length of the opener alone and an empty name, so
+// that the rest of the pattern reaches regexp.Compile as the user wrote it and
+// the error describes the real problem.
+func groupNameAt(s string) (name string, n int) {
+	var open int
+	switch {
+	case strings.HasPrefix(s, "(?P<"):
+		open = len("(?P<")
+	case strings.HasPrefix(s, "(?<"):
+		open = len("(?<")
+	default:
+		return "", 0
+	}
+	for i := open; i < len(s); i++ {
+		switch {
+		case s[i] == '>':
+			return s[open:i], i + 1
+		case !isNameByte(s[i]):
+			return "", open
+		}
+	}
+	return "", open
+}
+
+// isNameByte reports whether c may appear in a capture-group name; Go's regexp
+// parser accepts word characters only.
+func isNameByte(c byte) bool {
+	return c == '_' || isDigit(c) || (c|0x20 >= 'a' && c|0x20 <= 'z')
 }
 
 // boundaryOK reports whether the address text at sub[s:e] is delimited by

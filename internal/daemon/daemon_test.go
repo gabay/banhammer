@@ -18,6 +18,7 @@ import (
 	"banhammer/internal/config"
 	"banhammer/internal/control"
 	"banhammer/internal/model"
+	"banhammer/internal/window"
 )
 
 type recordingRunner struct {
@@ -656,8 +657,8 @@ func TestDaemon_MetricsServer(t *testing.T) {
 		t.Errorf("GET /metrics status = %d, want 200", resp2.StatusCode)
 	}
 	mBody, _ := io.ReadAll(resp2.Body)
-	if !strings.Contains(string(mBody), "lines_read") {
-		t.Errorf("GET /metrics output missing lines_read: %s", mBody)
+	if !strings.Contains(string(mBody), "banhammer_lines_read_total") {
+		t.Errorf("GET /metrics output missing banhammer_lines_read_total: %s", mBody)
 	}
 }
 
@@ -828,4 +829,278 @@ func TestDaemon_Sweep(t *testing.T) {
 	waitForCondition(t, 2*time.Second, func() bool {
 		return d.Metrics().TrackedIPs("sshd") == 0
 	})
+}
+
+// TestApplyTrackerConfig pins the reload contract: a SIGHUP that does not change
+// a monitor's window sizing must not reset its counters, or every half-way-to-
+// banned attacker gets a clean slate on each reload.
+func TestApplyTrackerConfig(t *testing.T) {
+	const monitorName = "sshd"
+	attacker := netip.MustParseAddr("192.0.2.77")
+
+	tests := []struct {
+		name        string
+		mutate      func(m *config.Monitor)
+		removeAll   bool
+		wantPresent bool
+		wantLen     int
+	}{
+		{
+			name:        "unchanged sizing keeps counters",
+			mutate:      func(*config.Monitor) {},
+			wantPresent: true,
+			wantLen:     1,
+		},
+		{
+			name:        "threshold change rebuilds",
+			mutate:      func(m *config.Monitor) { m.Threshold = 9 },
+			wantPresent: true,
+			wantLen:     0,
+		},
+		{
+			name:        "window change rebuilds",
+			mutate:      func(m *config.Monitor) { m.Window = 42 * time.Minute },
+			wantPresent: true,
+			wantLen:     0,
+		},
+		{
+			name:        "max_tracked change rebuilds",
+			mutate:      func(m *config.Monitor) { m.MaxTracked = 7 },
+			wantPresent: true,
+			wantLen:     0,
+		},
+		{
+			name:        "removed monitor drops its tracker",
+			removeAll:   true,
+			wantPresent: false,
+		},
+		{
+			// An unrelated key must not disturb the trackers at all: this is the
+			// case the old "rebuild everything" code got wrong.
+			name:        "unrelated key change keeps counters",
+			mutate:      func(m *config.Monitor) { m.Bantime = 6 * time.Hour },
+			wantPresent: true,
+			wantLen:     1,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			stateDir := t.TempDir()
+			d, err := New(baseTestConfig(stateDir), WithRunner(&recordingRunner{}), WithControlSocket(""))
+			if err != nil {
+				t.Fatalf("New failed: %v", err)
+			}
+			defer d.Close()
+
+			mon := d.getMonitor(monitorName)
+			tr := window.New(mon.Threshold, mon.Window, mon.MaxTracked, d.now)
+			tr.Hit(attacker)
+			d.trackers[monitorName] = tr
+			if tr.Len() != 1 {
+				t.Fatalf("setup: tracker Len = %d, want 1", tr.Len())
+			}
+
+			next := baseTestConfig(stateDir)
+			if tc.removeAll {
+				next.Monitors = map[string]*config.Monitor{}
+			} else {
+				tc.mutate(next.Monitors[monitorName])
+			}
+
+			d.applyTrackerConfig(next)
+
+			got, present := d.trackers[monitorName]
+			if present != tc.wantPresent {
+				t.Fatalf("tracker present = %v, want %v", present, tc.wantPresent)
+			}
+			if !tc.wantPresent {
+				return
+			}
+			if got.Len() != tc.wantLen {
+				t.Errorf("tracker Len after reload = %d, want %d", got.Len(), tc.wantLen)
+			}
+		})
+	}
+}
+
+// TestDaemon_ReloadPreservesProgressToBan is the end-to-end form of the above:
+// two offenses, a reload, then the third offense must still trip a threshold of
+// three.
+func TestDaemon_ReloadPreservesProgressToBan(t *testing.T) {
+	stateDir := t.TempDir()
+	cfg := baseTestConfig(stateDir)
+	runner := &recordingRunner{}
+
+	d, err := New(cfg, WithRunner(runner), WithControlSocket(""))
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer d.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runErrCh := make(chan error, 1)
+	go func() { runErrCh <- d.Run(ctx) }()
+
+	line := model.Event{Monitor: "sshd", Raw: []byte("Failed password for invalid user root from 192.0.2.44")}
+	for range 2 {
+		if !d.Enqueue(line) {
+			t.Fatal("Enqueue returned false")
+		}
+	}
+	waitForCondition(t, 3*time.Second, func() bool { return d.Metrics().Matches("sshd") == 2 })
+
+	// A reload that leaves the window sizing alone.
+	reloaded := baseTestConfig(stateDir)
+	reloaded.AllowLocal = false
+	if err := d.Reload(reloaded); err != nil {
+		t.Fatalf("Reload failed: %v", err)
+	}
+
+	if !d.Enqueue(line) {
+		t.Fatal("Enqueue after reload returned false")
+	}
+	waitForCondition(t, 3*time.Second, func() bool { return runner.HasArg("192.0.2.44") })
+
+	cancel()
+	if err := <-runErrCh; err != nil {
+		t.Errorf("Run error: %v", err)
+	}
+}
+
+// TestDaemon_MatchedPatternReachesAction covers the {matched} template variable
+// end to end. It is the only variable sourced from the rule engine rather than
+// from the ban record's own fields, so nothing else proves it is plumbed.
+func TestDaemon_MatchedPatternReachesAction(t *testing.T) {
+	const pattern = "Failed password for .* from <IP>"
+
+	stateDir := t.TempDir()
+	cfg := baseTestConfig(stateDir)
+	cmdAction := config.ActionSpec{
+		Name:    "cmd",
+		Ban:     "/bin/true ban {ip} {monitor} {count} {family} {matched}",
+		Unban:   "/bin/true unban {ip}",
+		Timeout: 5 * time.Second,
+	}
+	cfg.Defaults.Action = cmdAction
+	cfg.Monitors["sshd"].Action = cmdAction
+
+	runner := &recordingRunner{}
+	d, err := New(cfg, WithRunner(runner), WithControlSocket(""))
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer d.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runErrCh := make(chan error, 1)
+	go func() { runErrCh <- d.Run(ctx) }()
+
+	line := model.Event{Monitor: "sshd", Raw: []byte("Failed password for invalid user root from 192.0.2.55")}
+	for range 3 {
+		if !d.Enqueue(line) {
+			t.Fatal("Enqueue returned false")
+		}
+	}
+	waitForCondition(t, 3*time.Second, func() bool { return runner.HasArg("192.0.2.55") })
+
+	// The pattern must arrive as one argv element: substitution happens after
+	// tokenization, so a pattern full of spaces must not split the command.
+	if !runner.HasArg(pattern) {
+		t.Errorf("{matched} did not reach the action as %q; calls: %v", pattern, runner.Calls())
+	}
+
+	cancel()
+	if err := <-runErrCh; err != nil {
+		t.Errorf("Run error: %v", err)
+	}
+}
+
+// TestDaemon_EnqueueAfterCloseIsRejected pins that the queue guard turns a
+// post-shutdown Enqueue into a false rather than a send-on-closed-channel panic.
+func TestDaemon_EnqueueAfterCloseIsRejected(t *testing.T) {
+	d, err := New(baseTestConfig(t.TempDir()), WithRunner(&recordingRunner{}), WithControlSocket(""))
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+
+	if !d.Enqueue(model.Event{Monitor: "sshd", Raw: []byte("hello")}) {
+		t.Fatal("Enqueue before Close = false, want true")
+	}
+	if err := d.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+	if d.Enqueue(model.Event{Monitor: "sshd", Raw: []byte("hello")}) {
+		t.Error("Enqueue after Close = true, want false")
+	}
+	if err := d.Close(); err != nil {
+		t.Errorf("second Close failed: %v", err)
+	}
+}
+
+// TestDaemon_RunAfterShutdownIsRejected: a Daemon is single-use, because
+// shutdown closes its channels. Re-running one used to panic.
+func TestDaemon_RunAfterShutdownIsRejected(t *testing.T) {
+	d, err := New(baseTestConfig(t.TempDir()), WithRunner(&recordingRunner{}), WithControlSocket(""))
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer d.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := d.Run(ctx); err != nil {
+		t.Fatalf("first Run failed: %v", err)
+	}
+
+	err = d.Run(context.Background())
+	if err == nil {
+		t.Fatal("second Run returned nil, want an error")
+	}
+	if !strings.Contains(err.Error(), "already shut down") {
+		t.Errorf("second Run error = %q, want it to mention 'already shut down'", err)
+	}
+}
+
+func TestDaemon_MonitorCustomChain(t *testing.T) {
+	cfg := baseTestConfig(t.TempDir())
+	cfg.Monitors["docker-web"] = &config.Monitor{
+		Name:   "docker-web",
+		File:   filepath.Join(cfg.StateDir, "docker.log"),
+		Format: "text",
+		Match:  config.Patterns{Line: []string{"attack from <IP>"}},
+		Settings: config.Settings{
+			Threshold:     1,
+			Window:        10 * time.Minute,
+			Bantime:       1 * time.Hour,
+			BantimeFactor: 1,
+			BantimeMax:    24 * time.Hour,
+			FindHistory:   24 * time.Hour,
+			MaxTracked:    1000,
+			StartAt:       "beginning",
+			OnRepeat:      "ignore",
+			Action: config.ActionSpec{
+				Name:    "iptables",
+				Chain:   "DOCKER-USER",
+				Timeout: 5 * time.Second,
+			},
+		},
+	}
+
+	runner := &recordingRunner{}
+	d, err := New(cfg, WithRunner(runner), WithControlSocket(""))
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer d.Close()
+
+	if err := d.backend.Start(context.Background()); err != nil {
+		t.Fatalf("backend.Start: %v", err)
+	}
+
+	if !runner.HasArg("DOCKER-USER") {
+		t.Fatalf("expected DOCKER-USER chain in runner calls, got: %v", runner.Calls())
+	}
 }

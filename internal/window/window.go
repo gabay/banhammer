@@ -110,23 +110,13 @@ type Tracker struct {
 //
 // A nil now defaults to time.Now.
 func New(threshold int, window time.Duration, maxTracked int, now func() time.Time) *Tracker {
-	if threshold < 1 {
-		threshold = 1
-	} else if threshold > maxThreshold {
-		threshold = maxThreshold
-	}
 	if now == nil {
 		now = time.Now
 	}
-	secs := int64(window / time.Second)
-	if secs < 1 {
-		secs = 1
-	} else if secs > maxWindowSecs {
-		secs = maxWindowSecs
-	}
+	th, secs := clampShape(threshold, window)
 	return &Tracker{
-		threshold:  uint32(threshold),
-		windowSecs: uint32(secs),
+		threshold:  th,
+		windowSecs: secs,
 		maxTracked: maxTracked,
 		now:        now,
 		lastSeen:   now(),
@@ -135,6 +125,24 @@ func New(threshold int, window time.Duration, maxTracked int, now func() time.Ti
 		mru:        nilIdx,
 		lru:        nilIdx,
 	}
+}
+
+// clampShape applies New's documented clamping to a threshold/window pair. It
+// is shared with SameShape so that the two can never disagree about whether a
+// reloaded config describes the tracker we already have.
+func clampShape(threshold int, window time.Duration) (uint32, uint32) {
+	if threshold < 1 {
+		threshold = 1
+	} else if threshold > maxThreshold {
+		threshold = maxThreshold
+	}
+	secs := int64(window / time.Second)
+	if secs < 1 {
+		secs = 1
+	} else if secs > maxWindowSecs {
+		secs = maxWindowSecs
+	}
+	return uint32(threshold), uint32(secs)
 }
 
 // Hit records one offense by ip and reports the current in-window count and
@@ -230,6 +238,18 @@ func (t *Tracker) Sweep() {
 // Len reports how many addresses are currently tracked. It never exceeds
 // maxTracked.
 func (t *Tracker) Len() int { return t.live }
+
+// SameShape reports whether the tracker was built with the given sizing, after
+// the same clamping New applies.
+//
+// It exists for config reloads: rebuilding a tracker throws away every
+// in-flight counter, so a reload that did not actually change a monitor's
+// threshold, window or cap must not hand half-way-to-banned attackers a clean
+// slate.
+func (t *Tracker) SameShape(threshold int, window time.Duration, maxTracked int) bool {
+	th, secs := clampShape(threshold, window)
+	return t.threshold == th && t.windowSecs == secs && t.maxTracked == maxTracked
+}
 
 // Forget discards any state for ip, as done when the address gets banned and
 // its hits stop being interesting.
