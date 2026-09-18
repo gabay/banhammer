@@ -353,6 +353,30 @@ A hardened systemd unit file is included in [`banhammer.service`](./banhammer.se
 
 ---
 
+## Docker
+
+The published image runs as **root** by default. Banhammer's firewall backends
+(`iptables`/`ip6tables`/`nftables`/`ipset`) need at least `CAP_NET_ADMIN` and
+`CAP_NET_RAW` to mutate host firewall state, and root avoids fighting
+capability plumbing across the different backends and their helper binaries.
+
+If your setup allows it and you only need `action: dryrun` or the metrics
+endpoint (no real firewall mutation), you can drop privileges yourself:
+
+```bash
+docker run \
+  --user 1000:1000 \
+  --cap-add=NET_ADMIN --cap-add=NET_RAW \
+  -v $(pwd)/config.yaml:/etc/banhammer/config.yaml \
+  banhammer
+```
+
+Note that capabilities alone may not be sufficient for every backend/kernel
+combination (e.g. some `iptables-legacy` or `nftables` setups still expect an
+actual root UID) — fall back to running as root if you hit permission errors.
+
+---
+
 ## Performance & Verification
 
 Banhammer includes comprehensive benchmarks measuring throughput across synthetic 1M-line corpora:

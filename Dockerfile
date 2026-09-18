@@ -42,16 +42,11 @@ COPY --from=builder /bin/banhammer /usr/local/bin/banhammer
 COPY config.example.yaml /etc/banhammer/config.yaml
 
 # Set up default directories for state and configuration
-RUN addgroup -S banhammer && adduser -S -G banhammer -H -s /sbin/nologin banhammer \
-    && mkdir -p /var/lib/banhammer /run/banhammer \
-    && chown -R banhammer:banhammer /var/lib/banhammer /run/banhammer \
+RUN mkdir -p /var/lib/banhammer /run/banhammer \
     && chmod 750 /var/lib/banhammer /run/banhammer
 
-# Unprivileged by default. The firewall backends need more than this — see the
-# Docker section of README.md for the --cap-add/--network flags and the
-# --user 0:0 override they imply; `action: dryrun` and the metrics endpoint
-# work as-is.
-USER banhammer
+# Runs as root by default — see the Docker section of README.md for why and
+# how to drop privileges.
 
 EXPOSE 9777
 
