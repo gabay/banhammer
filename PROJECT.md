@@ -3,8 +3,6 @@
 A small, single-binary intrusion-prevention daemon in the spirit of `fail2ban`, without
 the Python runtime, the `.conf`/`.local` inheritance maze, or the per-jail process fan-out.
 
-> **Status:** design only. No code has been written yet. This document is the spec to build against.
-
 ---
 
 ## 1. Goals & Non-Goals
@@ -36,7 +34,7 @@ the Python runtime, the `.conf`/`.local` inheritance maze, or the per-jail proce
 * **Key types:** `netip.Addr` as the counter map key — 24 B, comparable, allocation-free.
 * **Dependencies, deliberately few:** `fsnotify` (file watching), `cobra` (CLI), `gopkg.in/yaml.v3`.
   Everything else — JSON scanning, tailing, the scheduler, the firewall backends — is stdlib.
-* **Toolchain:** Go 1.26 (matches `jamtag-go` in this repo).
+* **Toolchain:** Go 1.26.
 
 ---
 
@@ -206,8 +204,8 @@ configured with `max_tracked: 100000` under a spoofed-source flood will use most
   auto-adds loopback + the host's own interface addresses + RFC1918 if configured.
 * **Ban record:** `{ip, monitor, at, until, count, offense#}`. Dedupe: an already-banned IP that
   keeps matching only extends `until` if `on_repeat: extend` (default `ignore`).
-* **Escalation** (optional): `bantime_factor: 2`, `bantime_max: 168h` — the *n*-th offense for an
-  IP gets `min(bantime * factor^(n-1), max)`. Offense history kept for `find_history` (default 24h).
+* **Escalation** (default `bantime_factor: 2`, `bantime_max: 168h`): the *n*-th offense for an
+  IP gets `min(bantime * factor^(n-1), max)`. Offense history kept for `find_history` (default 168h).
 * **Unban scheduling:** a single min-heap keyed on `until` + one `time.Timer` re-armed at the head.
   Not one timer per ban. Wakeups are O(bans expiring), not O(bans).
 * **Restart:** on start, load state; bans still in the future are re-applied to the firewall

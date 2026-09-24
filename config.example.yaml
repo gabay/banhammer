@@ -19,9 +19,9 @@ defaults:
   #   timeout: 10s
   start_at: checkpoint             # checkpoint | end | beginning
   on_repeat: ignore                # ignore | extend  (behaviour when an already-banned IP re-offends)
-  # bantime_factor: 1              # multiply bantime by this per prior offense (1 = no escalation)
+  # bantime_factor: 2              # multiply bantime by this per prior offense (1 = no escalation)
   # bantime_max: 168h              # ceiling for an escalated bantime
-  # find_history: 24h              # how long prior offenses count towards escalation
+  # find_history: 168h             # how long prior offenses count towards escalation
   # max_tracked: 100000            # LRU cap on tracked IPs, per monitor
 
 allow_local: true                  # never ban loopback or this host's own addresses

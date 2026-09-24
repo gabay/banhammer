@@ -93,9 +93,9 @@ defaults:
   threshold: 5          # hits before ban
   window: 10m           # sliding window
   bantime: 1h           # ban duration
-  bantime_factor: 1     # exponential escalation multiplier
+  bantime_factor: 2     # exponential escalation multiplier
   bantime_max: 168h     # max ban duration
-  find_history: 24h     # offense history retention
+  find_history: 168h    # offense history retention
   max_tracked: 100000   # LRU cap for tracked IPs
   action: iptables      # iptables | nft | ipset | cmd
 

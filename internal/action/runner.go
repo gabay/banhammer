@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+	"syscall"
 )
 
 // maxCapturedOutput bounds how much of a child's stdout/stderr we keep. A
@@ -57,6 +58,11 @@ func (execRunner) Run(ctx context.Context, argv []string, shell bool) ([]byte, e
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	cmd.Stdin = nil
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		// Supplying a negative PID targets the entire process group
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
 
 	err := cmd.Run()
 	if err == nil {

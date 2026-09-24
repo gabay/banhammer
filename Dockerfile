@@ -21,8 +21,7 @@ FROM alpine:3.22
 
 LABEL org.opencontainers.image.title="banhammer" \
       org.opencontainers.image.description="Single-binary intrusion prevention daemon: tails logs, bans offenders via iptables/nft/ipset." \
-      org.opencontainers.image.source="https://github.com/roigabay/banhammer" \
-      org.opencontainers.image.licenses="Apache-2.0"
+      org.opencontainers.image.source="https://github.com/gabay/banhammer"
 
 # Install required firewall utilities for backends, CA certificates, and tzdata
 RUN apk add --no-cache \
@@ -53,7 +52,7 @@ EXPOSE 9777
 # /healthz is only served when metrics.listen is configured; the check is a
 # no-op signal ("unhealthy") otherwise.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD wget -q -O /dev/null http://127.0.0.1:9777/healthz || exit 1
+    CMD banhammer status
 
 ENTRYPOINT ["banhammer"]
 CMD ["run", "-c", "/etc/banhammer/config.yaml", "--socket", "/run/banhammer/control.sock"]

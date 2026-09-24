@@ -161,16 +161,16 @@ func TestExecRunner(t *testing.T) {
 		}
 	})
 
-	t.Run("context cancellation kills the child", func(t *testing.T) {
+	t.Run("context cancellation kills all children", func(t *testing.T) {
 		t.Parallel()
 		cctx, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
 		defer cancel()
 		start := time.Now()
-		_, err := r.Run(cctx, []string{"/bin/sh", "-c", "sleep 30"}, false)
+		_, err := r.Run(cctx, []string{"/bin/sh", "-c", "sleep 1"}, false)
 		if err == nil {
 			t.Fatal("expected an error when the deadline passes")
 		}
-		if elapsed := time.Since(start); elapsed > 5*time.Second {
+		if elapsed := time.Since(start); elapsed >= 1*time.Second {
 			t.Fatalf("Run took %v, want prompt cancellation", elapsed)
 		}
 	})

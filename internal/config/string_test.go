@@ -56,8 +56,8 @@ metrics:        127.0.0.1:9777
 
 defaults:
   threshold:      3 hits in 90s
-  bantime:        1h (factor 1, max 168h)
-  find_history:   24h
+  bantime:        1h (factor 2, max 168h)
+  find_history:   168h
   max_tracked:    100000
   start_at:       checkpoint
   on_repeat:      ignore
@@ -72,8 +72,8 @@ monitor "caddy":
   ip_field:       request.remote_ip
   contains:       "40"
   threshold:      3 hits in 90s
-  bantime:        1h (factor 1, max 168h)
-  find_history:   24h
+  bantime:        1h (factor 2, max 168h)
+  find_history:   168h
   max_tracked:    100000
   start_at:       checkpoint
   on_repeat:      ignore
@@ -86,7 +86,7 @@ monitor "remote":
   match:          "rhost=<IP>"
   threshold:      3 hits in 90s
   bantime:        24h (factor 2, max 168h)
-  find_history:   24h
+  find_history:   168h
   max_tracked:    100000
   start_at:       checkpoint
   on_repeat:      ignore

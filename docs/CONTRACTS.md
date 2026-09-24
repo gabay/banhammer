@@ -51,9 +51,9 @@ type Settings struct {
     Threshold     int           // default 5
     Window        time.Duration // default 10m
     Bantime       time.Duration // default 1h
-    BantimeFactor float64       // default 1 (no escalation)
+    BantimeFactor float64       // default 2 (doubles bantime per repeat offense)
     BantimeMax    time.Duration // default 168h
-    FindHistory   time.Duration // default 24h
+    FindHistory   time.Duration // default 168h
     MaxTracked    int           // default 100000
     StartAt       string        // checkpoint|end|beginning, default checkpoint
     OnRepeat      string        // ignore|extend, default ignore
