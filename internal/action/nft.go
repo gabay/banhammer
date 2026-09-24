@@ -130,5 +130,20 @@ func (n *nft) Unban(ctx context.Context, b model.Ban) error {
 	return nil
 }
 
-// Stop leaves the table in place so bans survive a restart.
-func (n *nft) Stop(context.Context) error { return nil }
+// Stop leaves the table in place so bans survive a restart, unless
+// flush_on_exit is set, in which case it deletes the whole table (chain,
+// sets and rules all go with it in one step).
+func (n *nft) Stop(ctx context.Context) error {
+	if !n.flushOnExit {
+		return nil
+	}
+	argv := []string{"nft", "delete", "table", nftFamily, nftTable}
+	if _, err := n.exec(ctx, false, argv...); err != nil {
+		if ExitCode(err) > 0 && stderrContains(err, nftNotFound...) {
+			return nil
+		}
+		return fmt.Errorf("deleting nft table %s: %w", nftTable, err)
+	}
+	n.log.Info("removed nft table", "table", nftTable)
+	return nil
+}

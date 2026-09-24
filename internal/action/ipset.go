@@ -2,6 +2,7 @@ package action
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"banhammer/internal/model"
@@ -132,5 +133,43 @@ func (s *ipset) Unban(ctx context.Context, b model.Ban) error {
 	return nil
 }
 
-// Stop leaves the sets populated; bans survive a restart by design.
-func (s *ipset) Stop(context.Context) error { return nil }
+// Stop leaves the sets populated by default; bans survive a restart by
+// design. When flush_on_exit is set it removes the match-set rules it
+// installed and destroys both sets.
+func (s *ipset) Stop(ctx context.Context) error {
+	if !s.flushOnExit {
+		return nil
+	}
+	var errs []error
+	for _, f := range []struct {
+		x   *xtables
+		set string
+	}{{s.t.v4, setV4}, {s.t.v6, setV6}} {
+		if f.x.ok {
+			if err := s.removeMatchRule(ctx, f.x, f.set); err != nil {
+				errs = append(errs, err)
+			}
+		}
+		if _, err := s.exec(ctx, false, "ipset", "destroy", f.set); err != nil {
+			if !(ExitCode(err) > 0 && stderrContains(err, ipsetNotFound...)) {
+				errs = append(errs, fmt.Errorf("destroying ipset %s: %w", f.set, err))
+			}
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// removeMatchRule undoes matchRule: delete the "-m set --match-set" rule this
+// backend installed. A rule already gone is not an error.
+func (s *ipset) removeMatchRule(ctx context.Context, x *xtables, set string) error {
+	rule := []string{s.t.chain, "-m", "set", "--match-set", set, "src", "-j", "DROP"}
+	argv := append([]string{"-t", "filter", "-D"}, rule...)
+	if _, err := s.exec(ctx, false, x.args(argv...)...); err != nil {
+		if ExitCode(err) > 0 && stderrContains(err, iptablesNotFound...) {
+			return nil
+		}
+		return fmt.Errorf("removing match-set rule via %s: %w", x.bin, err)
+	}
+	s.log.Info("removed match-set rule", "binary", x.bin, "chain", s.t.chain, "set", set)
+	return nil
+}

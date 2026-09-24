@@ -90,6 +90,7 @@ type ActionSpec struct {
     Stop    string
     Shell   bool
     Timeout time.Duration // default 10s
+    FlushOnExit bool      // default false; removes chain/table/sets on a clean Stop
 }
 ```
 
@@ -210,6 +211,8 @@ type Backend interface {
     Start(ctx context.Context) error
     Ban(ctx context.Context, b model.Ban) error
     Unban(ctx context.Context, b model.Ban) error
+    // Stop is a no-op unless Spec.FlushOnExit is set, in which case the
+    // built-in backends tear down whatever Start created.
     Stop(ctx context.Context) error
 }
 

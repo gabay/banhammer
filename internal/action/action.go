@@ -53,6 +53,13 @@ type Spec struct {
 	// DryRun wraps whichever backend Name selects so that nothing is executed;
 	// every command that would have run is logged instead.
 	DryRun bool
+
+	// FlushOnExit tears down the chain/table/sets this backend created (and
+	// every rule in them) on a clean Stop. Default false: bans and the
+	// firewall state that enforces them survive a daemon restart. Ignored by
+	// the cmd backend, which already exposes an operator-supplied Stop
+	// template for this.
+	FlushOnExit bool
 }
 
 // Backend applies and removes bans through one concrete mechanism.
@@ -108,7 +115,7 @@ func New(spec Spec, r Runner, log *slog.Logger) (Backend, error) {
 		log.Info("dry-run: no firewall changes will be made", "backend", name)
 	}
 
-	base := base{run: r, log: log.With("backend", name), timeout: spec.Timeout}
+	base := base{run: r, log: log.With("backend", name), timeout: spec.Timeout, flushOnExit: spec.FlushOnExit}
 
 	var (
 		b   Backend
@@ -132,12 +139,13 @@ func New(spec Spec, r Runner, log *slog.Logger) (Backend, error) {
 	return b, nil
 }
 
-// base is the plumbing every backend shares: a Runner, a logger and the
-// per-command timeout.
+// base is the plumbing every backend shares: a Runner, a logger, the
+// per-command timeout and whether Stop should tear down what Start built.
 type base struct {
-	run     Runner
-	log     *slog.Logger
-	timeout time.Duration
+	run         Runner
+	log         *slog.Logger
+	timeout     time.Duration
+	flushOnExit bool
 }
 
 // exec runs one command under the per-command timeout. The timeout is applied

@@ -109,6 +109,11 @@ type ActionSpec struct {
 	Stop    string
 	Shell   bool
 	Timeout time.Duration // default 10s
+	// FlushOnExit tears down the chain/table/sets this backend created (and
+	// every rule in them) when the daemon stops cleanly. Default false: bans
+	// survive a restart, matching the persisted state. Ignored by the cmd
+	// backend, which already gives the operator a `stop` template for this.
+	FlushOnExit bool
 }
 
 // LoadError reports every problem found in a configuration file at once.
@@ -393,6 +398,7 @@ func (a *rawAction) resolve(base ActionSpec) ActionSpec {
 	setIf(&spec.Stop, a.Stop)
 	setIf(&spec.Shell, a.Shell)
 	setDur(&spec.Timeout, a.Timeout)
+	setIf(&spec.FlushOnExit, a.FlushOnExit)
 	if a.Name == nil && a.hasTemplates() {
 		spec.Name = commandAction
 	}

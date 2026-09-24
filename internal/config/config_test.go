@@ -226,6 +226,48 @@ monitors:
 	}
 }
 
+func TestFlushOnExit(t *testing.T) {
+	t.Parallel()
+
+	const src = `
+defaults:
+  action:
+    name: iptables
+    flush_on_exit: true
+monitors:
+  inherits:
+    file: /a
+    match: "<IP>"
+  overrides:
+    file: /b
+    match: "<IP>"
+    action: nft
+  explicit:
+    file: /c
+    match: "<IP>"
+    action:
+      name: nft
+      flush_on_exit: true
+`
+	c := mustParse(t, src)
+
+	if !c.Defaults.Action.FlushOnExit {
+		t.Errorf("defaults action.FlushOnExit = false, want true")
+	}
+	if in := c.Monitors["inherits"].Action; !in.FlushOnExit {
+		t.Errorf("inherited action = %+v, want FlushOnExit true", in)
+	}
+	// Switching backend resets flush_on_exit to the default (false), the same
+	// way it resets timeout: a monitor should not accidentally inherit a
+	// destructive setting meant for a different backend.
+	if ov := c.Monitors["overrides"].Action; ov.FlushOnExit {
+		t.Errorf("overridden action = %+v, want FlushOnExit false after switching backend", ov)
+	}
+	if ex := c.Monitors["explicit"].Action; !ex.FlushOnExit {
+		t.Errorf("explicit action = %+v, want FlushOnExit true", ex)
+	}
+}
+
 // TestExplicitZeroIsNotUnset is the reason every raw field is a pointer.
 func TestExplicitZeroIsNotUnset(t *testing.T) {
 	t.Parallel()

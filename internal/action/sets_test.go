@@ -223,6 +223,47 @@ func TestIPSetWithoutIPv6(t *testing.T) {
 	}
 }
 
+func TestIPSetStopLeavesSetsByDefault(t *testing.T) {
+	t.Parallel()
+	f := &fakeRunner{handler: cleanHost}
+	b, err := New(Spec{Name: "ipset"}, f, discardLogger())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := b.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	f.reset()
+	if err := b.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if n := len(f.argvs()); n != 0 {
+		t.Fatalf("Stop ran %d commands, want 0 (bans must survive a restart)", n)
+	}
+}
+
+func TestIPSetStopFlushesWhenConfigured(t *testing.T) {
+	t.Parallel()
+	f := &fakeRunner{handler: cleanHost}
+	b, err := New(Spec{Name: "ipset", FlushOnExit: true}, f, discardLogger())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := b.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	f.reset()
+	if err := b.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	requireArgvSeq(t, f.argvs(), [][]string{
+		{"iptables", "--wait", "-t", "filter", "-D", "INPUT", "-m", "set", "--match-set", "banhammer4", "src", "-j", "DROP"},
+		{"ipset", "destroy", "banhammer4"},
+		{"ip6tables", "--wait", "-t", "filter", "-D", "INPUT", "-m", "set", "--match-set", "banhammer6", "src", "-j", "DROP"},
+		{"ipset", "destroy", "banhammer6"},
+	})
+}
+
 func TestNFTStart(t *testing.T) {
 	t.Parallel()
 
@@ -416,4 +457,46 @@ func TestNFTCustomChain(t *testing.T) {
 		{"nft", "add", "rule", "inet", "banhammer", "forward", "ip", "saddr", "@banhammer4", "drop"},
 		{"nft", "add", "rule", "inet", "banhammer", "forward", "ip6", "saddr", "@banhammer6", "drop"},
 	})
+}
+
+func TestNFTStopLeavesTableByDefault(t *testing.T) {
+	t.Parallel()
+	f := &fakeRunner{handler: func([]string, bool) ([]byte, error) { return nil, nil }}
+	b, err := New(Spec{Name: "nft"}, f, discardLogger())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := b.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if n := len(f.argvs()); n != 0 {
+		t.Fatalf("Stop ran %d commands, want 0 (bans must survive a restart)", n)
+	}
+}
+
+func TestNFTStopFlushesWhenConfigured(t *testing.T) {
+	t.Parallel()
+	f := &fakeRunner{handler: func([]string, bool) ([]byte, error) { return nil, nil }}
+	b, err := New(Spec{Name: "nft", FlushOnExit: true}, f, discardLogger())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := b.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	requireArgv(t, f.last(t), []string{"nft", "delete", "table", "inet", "banhammer"})
+}
+
+func TestNFTStopFlushToleratesAlreadyGone(t *testing.T) {
+	t.Parallel()
+	f := &fakeRunner{handler: func([]string, bool) ([]byte, error) {
+		return nil, exitErr(1, "Error: No such file or directory")
+	}}
+	b, err := New(Spec{Name: "nft", FlushOnExit: true}, f, discardLogger())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := b.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop with table already gone should succeed, got: %v", err)
+	}
 }

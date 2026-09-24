@@ -299,6 +299,49 @@ func TestIPTablesStopLeavesRulesInPlace(t *testing.T) {
 	}
 }
 
+func TestIPTablesStopFlushesWhenConfigured(t *testing.T) {
+	t.Parallel()
+	f := &fakeRunner{handler: cleanHost}
+	b, err := New(Spec{Name: "iptables", FlushOnExit: true}, f, discardLogger())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := b.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	f.reset()
+
+	if err := b.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	requireArgvSeq(t, f.argvs(), [][]string{
+		{"iptables", "--wait", "-t", "filter", "-D", "INPUT", "-j", "BANHAMMER"},
+		{"iptables", "--wait", "-t", "filter", "-F", "BANHAMMER"},
+		{"iptables", "--wait", "-t", "filter", "-X", "BANHAMMER"},
+		{"ip6tables", "--wait", "-t", "filter", "-D", "INPUT", "-j", "BANHAMMER"},
+		{"ip6tables", "--wait", "-t", "filter", "-F", "BANHAMMER"},
+		{"ip6tables", "--wait", "-t", "filter", "-X", "BANHAMMER"},
+	})
+}
+
+func TestIPTablesStopFlushToleratesAlreadyGone(t *testing.T) {
+	t.Parallel()
+	f := &fakeRunner{handler: cleanHost}
+	b, err := New(Spec{Name: "iptables", FlushOnExit: true}, f, discardLogger())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := b.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	f.handler = func(argv []string, _ bool) ([]byte, error) {
+		return nil, exitErr(1, "iptables: No chain/target/match by that name.")
+	}
+	if err := b.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop with everything already gone should succeed, got: %v", err)
+	}
+}
+
 func TestIPTablesPerCommandTimeout(t *testing.T) {
 	t.Parallel()
 	// A backend command must carry the Spec timeout as a deadline, so a wedged

@@ -98,6 +98,9 @@ defaults:
   find_history: 168h    # offense history retention
   max_tracked: 100000   # LRU cap for tracked IPs
   action: iptables      # iptables | nft | ipset | cmd
+  # action:
+  #   name: iptables
+  #   flush_on_exit: false # true removes firewall state on a clean shutdown
 
 monitors:
   sshd:
@@ -144,6 +147,27 @@ defaults:
 ```
 
 For custom command actions (`cmd`), `{chain}` is available as a template variable alongside `{ip}`, `{monitor}`, `{bantime}`, `{count}`, `{family}`, and `{matched}`.
+
+### Flush on Exit
+
+By default, bans and the firewall state that enforces them survive a daemon restart: `Stop` is a no-op, matching the persisted state in `bans.json`. Set `flush_on_exit: true` on an action to instead tear everything down on a clean shutdown (`SIGINT`/`SIGTERM`):
+
+```yaml
+defaults:
+  action:
+    name: iptables
+    flush_on_exit: true   # remove the BANHAMMER chain and its rules on shutdown
+```
+
+What gets removed depends on the backend:
+
+| Backend | Removed on Stop |
+|---|---|
+| `iptables` / `ipset` | The jump/match-set rule in `chain` (default `INPUT`), then the `BANHAMMER` chain (or, for `ipset`, both `banhammer4`/`banhammer6` sets) |
+| `nft` | The whole `inet banhammer` table (chain, sets and rules go with it) |
+| `cmd` | Not applicable — use your own `stop:` template, which already runs unconditionally on shutdown |
+
+`flush_on_exit` is per-action, so it follows the same inheritance rules as `chain` and `timeout`: a monitor that only sets `chain` or `timeout` keeps the default's `flush_on_exit`, while switching `name` or supplying command templates resets it to `false` unless set explicitly. A killed daemon (`SIGKILL`, a crash) never runs `Stop`, so bans are only removed by a graceful shutdown.
 
 ---
 

@@ -17,6 +17,8 @@ defaults:
   #   name: iptables               # iptables | ipset | nft | dryrun
   #   chain: INPUT                 # INPUT (default) | DOCKER-USER (for Docker hosts) | FORWARD | ...
   #   timeout: 10s
+  #   flush_on_exit: false         # true removes the chain/table/sets (and every
+  #                                 # rule in them) on a clean shutdown; ignored by cmd
   start_at: checkpoint             # checkpoint | end | beginning
   on_repeat: ignore                # ignore | extend  (behaviour when an already-banned IP re-offends)
   # bantime_factor: 2              # multiply bantime by this per prior offense (1 = no escalation)

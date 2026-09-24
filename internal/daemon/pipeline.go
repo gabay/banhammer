@@ -250,15 +250,16 @@ func toActionSpec(s config.ActionSpec, dryRun bool) action.Spec {
 		timeout = 10 * time.Second
 	}
 	return action.Spec{
-		Name:    name,
-		Chain:   chain,
-		Start:   s.Start,
-		Ban:     s.Ban,
-		Unban:   s.Unban,
-		Stop:    s.Stop,
-		Shell:   s.Shell,
-		Timeout: timeout,
-		DryRun:  dryRun,
+		Name:        name,
+		Chain:       chain,
+		Start:       s.Start,
+		Ban:         s.Ban,
+		Unban:       s.Unban,
+		Stop:        s.Stop,
+		Shell:       s.Shell,
+		Timeout:     timeout,
+		DryRun:      dryRun,
+		FlushOnExit: s.FlushOnExit,
 	}
 }
 

@@ -103,6 +103,9 @@ func actionLines(a ActionSpec) []string {
 	if a.Shell {
 		parts = append(parts, "via shell")
 	}
+	if a.FlushOnExit {
+		parts = append(parts, "flush on exit")
+	}
 	head := fmt.Sprintf("%s (%s)", a.Name, strings.Join(parts, ", "))
 	lines := []string{head}
 	for _, t := range []struct{ name, tmpl string }{

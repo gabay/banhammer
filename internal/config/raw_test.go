@@ -142,7 +142,7 @@ func TestKnownKeysMatchStructTags(t *testing.T) {
 			"strip_syslog", "threshold", "window",
 		},
 		"config.rawMetrics": {"listen"},
-		"config.rawAction":  {"ban", "chain", "name", "shell", "start", "stop", "timeout", "unban"},
+		"config.rawAction":  {"ban", "chain", "flush_on_exit", "name", "shell", "start", "stop", "timeout", "unban"},
 	}
 
 	got := keyIndex()
@@ -170,14 +170,15 @@ func TestActionSwitchHandlesEveryKey(t *testing.T) {
 	t.Parallel()
 
 	values := map[string]string{
-		"name":    "cmd",
-		"chain":   "DOCKER-USER",
-		"start":   "s",
-		"ban":     "b",
-		"unban":   "u",
-		"stop":    "p",
-		"shell":   "true",
-		"timeout": "5s",
+		"name":          "cmd",
+		"chain":         "DOCKER-USER",
+		"start":         "s",
+		"ban":           "b",
+		"unban":         "u",
+		"stop":          "p",
+		"shell":         "true",
+		"timeout":       "5s",
+		"flush_on_exit": "true",
 	}
 	keys := actionKeys()
 	if len(keys) == 0 {

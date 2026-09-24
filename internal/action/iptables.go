@@ -189,6 +189,45 @@ func (t *iptables) Unban(ctx context.Context, b model.Ban) error {
 	return nil
 }
 
-// Stop intentionally leaves the chain and its rules in place: bans outlive the
-// daemon (flush_on_exit defaults to false) and Start is idempotent.
-func (t *iptables) Stop(context.Context) error { return nil }
+// Stop leaves the chain and its rules in place by default: bans outlive the
+// daemon (flush_on_exit defaults to false) and Start is idempotent. When
+// flush_on_exit is set it tears down everything Start built, for both
+// families that were successfully set up.
+func (t *iptables) Stop(ctx context.Context) error {
+	if !t.flushOnExit {
+		return nil
+	}
+	var errs []error
+	for _, x := range []*xtables{t.v4, t.v6} {
+		if !x.setup || !x.ok {
+			continue
+		}
+		if err := t.teardown(ctx, x); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// teardown removes the jump from t.chain and deletes chainName, undoing setup.
+// A missing jump or chain (an operator flushed it by hand) is not an error:
+// the desired end state, no trace of banhammer left, already holds.
+func (t *iptables) teardown(ctx context.Context, x *xtables) error {
+	if _, err := t.exec(ctx, false, x.args("-t", "filter", "-D", t.chain, "-j", chainName)...); err != nil {
+		if !(ExitCode(err) > 0 && stderrContains(err, iptablesNotFound...)) {
+			return fmt.Errorf("removing %s jump via %s: %w", t.chain, x.bin, err)
+		}
+	}
+	if _, err := t.exec(ctx, false, x.args("-t", "filter", "-F", chainName)...); err != nil {
+		if !(ExitCode(err) > 0 && stderrContains(err, iptablesNotFound...)) {
+			return fmt.Errorf("flushing chain %s via %s: %w", chainName, x.bin, err)
+		}
+	}
+	if _, err := t.exec(ctx, false, x.args("-t", "filter", "-X", chainName)...); err != nil {
+		if !(ExitCode(err) > 0 && stderrContains(err, iptablesNotFound...)) {
+			return fmt.Errorf("deleting chain %s via %s: %w", chainName, x.bin, err)
+		}
+	}
+	t.log.Info("removed chain jump and rules", "binary", x.bin, "from", t.chain, "chain", chainName)
+	return nil
+}

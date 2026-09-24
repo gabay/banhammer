@@ -238,6 +238,11 @@ Built-ins (selected by `action: <name>` or fully overridden by a command templat
 * Executor: serialized queue, per-command timeout (default 10 s), retry ×3 with backoff,
   failures logged + counted; a failing ban is retried but never blocks the pipeline.
 * `flush_on_exit: false` by default (bans survive a daemon restart, matching the persisted state).
+  When `true`, a clean shutdown (`SIGINT`/`SIGTERM`) tears down whatever `Start` built: the
+  `BANHAMMER` chain and its jump rule for `iptables`, both sets plus their match rules for
+  `ipset`, or the whole `inet banhammer` table for `nft`. Not applicable to `cmd`, which already
+  gets an operator-supplied `stop:` template. A killed daemon (`SIGKILL`, a crash) never runs
+  `Stop`, so this only fires on a graceful exit.
 
 ### 4.7 Persistence
 

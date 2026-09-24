@@ -69,14 +69,15 @@ type rawMonitor struct {
 // rawAction is the `action:` value: either a backend name or a block of
 // command templates / backend parameters.
 type rawAction struct {
-	Name    *string   `yaml:"name"`
-	Chain   *string   `yaml:"chain"`
-	Start   *string   `yaml:"start"`
-	Ban     *string   `yaml:"ban"`
-	Unban   *string   `yaml:"unban"`
-	Stop    *string   `yaml:"stop"`
-	Shell   *bool     `yaml:"shell"`
-	Timeout *duration `yaml:"timeout"`
+	Name        *string   `yaml:"name"`
+	Chain       *string   `yaml:"chain"`
+	Start       *string   `yaml:"start"`
+	Ban         *string   `yaml:"ban"`
+	Unban       *string   `yaml:"unban"`
+	Stop        *string   `yaml:"stop"`
+	Shell       *bool     `yaml:"shell"`
+	Timeout     *duration `yaml:"timeout"`
+	FlushOnExit *bool     `yaml:"flush_on_exit"`
 }
 
 // UnmarshalYAML implements yaml.Unmarshaler for both action shapes.
@@ -138,6 +139,13 @@ func (a *rawAction) UnmarshalYAML(n *yaml.Node) error {
 					continue
 				}
 				a.Timeout = &d
+			case "flush_on_exit":
+				b, err := scalarBool(vn)
+				if err != nil {
+					msgs = append(msgs, msgAt(vn, "action flush_on_exit: %s", err))
+					continue
+				}
+				a.FlushOnExit = &b
 			default:
 				// Every other key in the block was still stored, so the
 				// monitor around it is worth validating.
