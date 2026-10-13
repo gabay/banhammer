@@ -71,6 +71,21 @@ type Persister interface {
 	SaveBans([]model.Ban) error
 }
 
+// Recorder is told about every *new* ban, for statistics. It is satisfied by
+// *stats.Ledger.
+//
+// It hears about exactly the bans MonitorStats.Banned counts: automatic and
+// manual bans, but not extensions of a live ban and not the bans Restore
+// re-applies at startup — those were recorded by the run that issued them,
+// and recording them again would make every restart look like an attack.
+//
+// Record is called after the manager's lock has been released, so unlike an
+// Enforcer it may take its own lock; it must still be quick, because it runs
+// on the aggregator's goroutine.
+type Recorder interface {
+	Record(model.Ban)
+}
+
 // Options configures a Manager. Only Enforcer and Persister are really
 // optional (a nil one is treated as a no-op, which is what `banhammer test`
 // wants); everything else has a working default.
@@ -83,6 +98,8 @@ type Options struct {
 	AllowLocal bool
 	Enforcer   Enforcer
 	Persister  Persister
+	// Recorder, if set, is told about each new ban. See Recorder.
+	Recorder Recorder
 	// Now defaults to time.Now. Injected so expiry is testable.
 	Now func() time.Time
 	Log *slog.Logger
@@ -154,6 +171,7 @@ type Manager struct {
 	log       *slog.Logger
 	enforcer  Enforcer
 	persister Persister
+	recorder  Recorder
 	newTimer  func(time.Duration) Timer
 
 	// Immutable after NewManager, hence lock-free in Allowed.
@@ -195,6 +213,7 @@ func NewManager(o Options) *Manager {
 		log:        o.Log,
 		enforcer:   o.Enforcer,
 		persister:  o.Persister,
+		recorder:   o.Recorder,
 		newTimer:   o.NewTimer,
 		allowLocal: o.AllowLocal,
 		wake:       make(chan struct{}, 1),
@@ -355,6 +374,7 @@ func (m *Manager) Offend(monitor string, ip netip.Addr, count int, pattern strin
 		snap, seq := m.stateLocked()
 		m.mu.Unlock()
 		m.counters.banned.Add(1)
+		m.record(b)
 		m.log.Info("banned", "ip", ip, "monitor", monitor, "count", count,
 			"offense", offense, "bantime", d, "until", until)
 		m.signal()
@@ -405,9 +425,20 @@ func (m *Manager) Ban(ip netip.Addr, monitor string, d time.Duration) error {
 	snap, seq := m.stateLocked()
 	m.mu.Unlock()
 
+	if !live {
+		m.record(b)
+	}
 	m.log.Info("banned manually", "ip", ip, "monitor", monitor, "until", b.Until, "already_banned", live)
 	m.signal()
 	return m.persist(seq, snap)
+}
+
+// record hands a new ban to the Recorder, if there is one. Called without the
+// lock; see Recorder for what counts as new.
+func (m *Manager) record(b model.Ban) {
+	if m.recorder != nil {
+		m.recorder.Record(b)
+	}
 }
 
 // applyLocked installs b and, when enforce is set, pushes it to the firewall.

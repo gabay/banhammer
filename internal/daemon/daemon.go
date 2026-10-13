@@ -41,11 +41,14 @@ import (
 	"banhammer/internal/ban"
 	"banhammer/internal/config"
 	"banhammer/internal/control"
+	"banhammer/internal/geoip"
 	"banhammer/internal/metrics"
 	"banhammer/internal/model"
 	"banhammer/internal/rule"
 	"banhammer/internal/source"
+	"banhammer/internal/stats"
 	"banhammer/internal/store"
+	"banhammer/internal/web"
 	"banhammer/internal/window"
 )
 
@@ -67,9 +70,10 @@ type Daemon struct {
 	controlSocket    string
 	controlSocketSet bool
 
-	offsetInterval time.Duration
-	sweepInterval  time.Duration
-	interfaces     ban.InterfaceLister
+	offsetInterval  time.Duration
+	historyInterval time.Duration
+	sweepInterval   time.Duration
+	interfaces      ban.InterfaceLister
 
 	store      *store.Store
 	storeOwned bool
@@ -78,6 +82,14 @@ type Daemon struct {
 	backend    action.Backend
 	executor   *action.Executor
 	banManager *ban.Manager
+
+	// ledger is the ban event log behind the statistics; it always runs,
+	// because `banhammer status` reports from it whether or not the web page
+	// is on. geo is the optional country database, swapped under geoMu by a
+	// reload that changes web.geoip.
+	ledger *stats.Ledger
+	geoMu  sync.RWMutex
+	geo    geoip.DB
 
 	rulesMu sync.RWMutex
 	rules   map[string]*rule.Set
@@ -96,6 +108,7 @@ type Daemon struct {
 
 	controlServer *control.Server
 	metricsServer *metrics.Server
+	webServer     *web.Server
 
 	running   atomic.Bool
 	closeOnce sync.Once
@@ -126,10 +139,15 @@ func New(cfg *config.Config, opts ...Option) (*Daemon, error) {
 		queueSize:      cfg.QueueSize,
 		numWorkers:     min(4, max(1, runtime.GOMAXPROCS(0))),
 		offsetInterval: 5 * time.Second,
-		sweepInterval:  10 * time.Second,
-		sweepReqCh:     make(chan struct{}, 1),
-		reloadAggCh:    make(chan *config.Config, 8),
-		srcStats:       make(map[source.Source]uint64),
+		// Slower than offsets on purpose: the ledger is rewritten whole, and
+		// at its cap that is a ~10 MB marshal and fsync — which, since it is
+		// dirtied by bans, would otherwise recur every 5 s for exactly as
+		// long as an attack lasts. A minute of lost chart on a crash is fine.
+		historyInterval: time.Minute,
+		sweepInterval:   10 * time.Second,
+		sweepReqCh:      make(chan struct{}, 1),
+		reloadAggCh:     make(chan *config.Config, 8),
+		srcStats:        make(map[source.Source]uint64),
 	}
 
 	for _, opt := range opts {
@@ -182,12 +200,24 @@ func New(cfg *config.Config, opts ...Option) (*Daemon, error) {
 	d.backend = &metricsBackend{backend: backend, metrics: d.metrics}
 	d.executor = action.NewExecutor(d.backend, d.log)
 
+	// 3b. Statistics ledger and optional country database. The database is
+	// opened before the ban manager exists because a bad path is a config
+	// error and should fail startup, like a bad backend does.
+	d.ledger = stats.NewLedger(stats.Options{Retention: cfg.Web.Retention, Now: d.now})
+	if db, err := openGeo(cfg.Web.GeoIP); err != nil {
+		d.cleanupStoreOnFailure()
+		return nil, fmt.Errorf("daemon: %w", err)
+	} else {
+		d.geo = db
+	}
+
 	// 4. Ban Manager
 	d.banManager = ban.NewManager(ban.Options{
 		Allowlist:  cfg.Allowlist,
 		AllowLocal: cfg.AllowLocal,
 		Enforcer:   d.executor,
 		Persister:  d.store,
+		Recorder:   d.ledger,
 		Now:        d.now,
 		Log:        d.log,
 		Interfaces: d.interfaces,
@@ -226,6 +256,15 @@ func New(cfg *config.Config, opts ...Option) (*Daemon, error) {
 		d.cleanupStoreOnFailure()
 		return nil, fmt.Errorf("daemon: restore bans: %w", err)
 	}
+
+	// 5b. Restore the ban ledger. Unlike bans this cannot fail the start:
+	// the store already turns a bad file into an empty one.
+	events, err := d.store.LoadHistory()
+	if err != nil {
+		d.cleanupStoreOnFailure()
+		return nil, fmt.Errorf("daemon: load ban history from store: %w", err)
+	}
+	d.ledger.Restore(events)
 
 	// 6. Compile rule sets for all monitors
 	d.rules = make(map[string]*rule.Set, len(cfg.Monitors))
@@ -284,12 +323,23 @@ func New(cfg *config.Config, opts ...Option) (*Daemon, error) {
 		d.metricsServer = metrics.NewServer(cfg.Metrics.Listen, d.metrics, d.log)
 	}
 
+	// 12. Read-only status page (if enabled)
+	if cfg.Web.Enabled {
+		d.webServer = web.NewServer(cfg.Web.Listen, d.Service(), d.log,
+			web.WithNow(d.now),
+			web.WithCountryName(geoip.Name),
+		)
+	}
+
 	return d, nil
 }
 
 func (d *Daemon) cleanupStoreOnFailure() {
 	if d.storeOwned && d.store != nil {
 		_ = d.store.Close()
+	}
+	if d.geo != nil {
+		_ = d.geo.Close()
 	}
 }
 
@@ -353,6 +403,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 	defer ctrlCancel()
 	metricsCtx, metricsCancel := context.WithCancel(context.Background())
 	defer metricsCancel()
+	webCtx, webCancel := context.WithCancel(context.Background())
+	defer webCancel()
 	srcCtx, srcCancel := context.WithCancel(context.Background())
 	defer srcCancel()
 
@@ -410,9 +462,20 @@ func (d *Daemon) Run(ctx context.Context) error {
 		}()
 	}
 
+	// 8b. Start the status page
+	if d.webServer != nil {
+		go func() {
+			if err := d.webServer.Run(webCtx); err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, web.ErrServerClosed) {
+				d.log.Error("status page server error", "err", err)
+			}
+		}()
+	}
+
 	// 9. Periodic Checkpoint Saving
 	offsetTicker := time.NewTicker(d.offsetInterval)
 	defer offsetTicker.Stop()
+	historyTicker := time.NewTicker(d.historyInterval)
+	defer historyTicker.Stop()
 
 	// Main supervisory wait loop
 waitLoop:
@@ -422,6 +485,8 @@ waitLoop:
 			break waitLoop
 		case <-offsetTicker.C:
 			_ = d.saveOffsets()
+		case <-historyTicker.C:
+			d.saveHistory()
 		}
 	}
 
@@ -439,23 +504,32 @@ waitLoop:
 	close(d.matchCh)
 	d.aggWg.Wait()
 
-	// Phase 4: Persist final offsets and flush store
+	// Phase 4: Persist final offsets, flush store
 	_ = d.saveOffsets()
 	_ = d.store.Flush()
 
-	// Phase 5: Stop control and metrics servers
+	// Phase 5: Stop control, metrics and status servers
 	ctrlCancel()
 	metricsCancel()
+	webCancel()
 	if d.controlServer != nil {
 		_ = d.controlServer.Close()
 	}
 	if d.metricsServer != nil {
 		_ = d.metricsServer.Close()
 	}
+	if d.webServer != nil {
+		_ = d.webServer.Close()
+	}
 
 	// Phase 6: Stop ban manager
 	banCancel()
 	banWg.Wait()
+
+	// Phase 6b: Persist the ban ledger. After phase 6, not phase 4: the
+	// control socket was live until phase 5 and could still issue a ban
+	// whose event would otherwise never reach history.json.
+	d.saveHistory()
 
 	// Phase 7: Stop action executor (drains remaining enqueued bans)
 	execCancel()
@@ -487,9 +561,18 @@ func (d *Daemon) Close() error {
 		if d.metricsServer != nil {
 			_ = d.metricsServer.Close()
 		}
+		if d.webServer != nil {
+			_ = d.webServer.Close()
+		}
 		if d.store != nil {
 			err = d.store.Close()
 		}
+		d.geoMu.Lock()
+		if d.geo != nil {
+			_ = d.geo.Close()
+			d.geo = nil
+		}
+		d.geoMu.Unlock()
 	})
 	return err
 }
@@ -497,6 +580,50 @@ func (d *Daemon) Close() error {
 // Metrics returns the in-memory metric registry used across daemon stages.
 func (d *Daemon) Metrics() *metrics.Registry {
 	return d.metrics
+}
+
+// Ledger returns the ban event ledger behind the statistics.
+func (d *Daemon) Ledger() *stats.Ledger {
+	return d.ledger
+}
+
+// saveHistory writes the ledger if anything changed since the last write. A
+// failure is logged and the ledger re-marked dirty so the next tick retries;
+// it never stops anything — the ledger is the least important state there is.
+func (d *Daemon) saveHistory() {
+	events, ok := d.ledger.Flushed()
+	if !ok {
+		return
+	}
+	if err := d.store.SaveHistory(events); err != nil {
+		d.ledger.MarkDirty()
+		d.log.Warn("saving ban history failed; will retry", "err", err, "events", len(events))
+	}
+}
+
+// geoLookup returns the current country database as the stats package sees
+// it, or nil when there is none. The conversion is explicit so that a nil
+// geoip.DB never becomes a non-nil stats.Lookup holding a nil.
+func (d *Daemon) geoLookup() stats.Lookup {
+	d.geoMu.RLock()
+	defer d.geoMu.RUnlock()
+	if d.geo == nil {
+		return nil
+	}
+	return d.geo
+}
+
+// openGeo opens the country database at path, or returns nil, nil for the
+// empty path, so that "no database" and "a database" are one code path.
+func openGeo(path string) (geoip.DB, error) {
+	if path == "" {
+		return nil, nil
+	}
+	db, err := geoip.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open web.geoip database: %w", err)
+	}
+	return db, nil
 }
 
 // syncBanMetrics copies the ban manager's per-monitor counters and source
@@ -552,6 +679,26 @@ func (d *Daemon) MetricsReady() <-chan struct{} {
 	return ch
 }
 
+// WebReady returns a channel that is closed once the status page is
+// listening, or immediately when it is not enabled.
+func (d *Daemon) WebReady() <-chan struct{} {
+	if d.webServer != nil {
+		return d.webServer.Ready()
+	}
+	ch := make(chan struct{})
+	close(ch)
+	return ch
+}
+
+// WebAddr returns the address the status page is bound to, or "" when it is
+// not enabled or not yet listening.
+func (d *Daemon) WebAddr() string {
+	if d.webServer == nil {
+		return ""
+	}
+	return d.webServer.Addr()
+}
+
 // Sweep signals the single-threaded Aggregator to perform an immediate sweep
 // of expired sliding-window entries.
 func (d *Daemon) Sweep() {
@@ -574,11 +721,17 @@ func (d *Daemon) Status() (control.StatusResponse, error) {
 	if bans == nil {
 		bans = []model.Ban{}
 	}
+	summary := stats.Summarize(d.ledger.Snapshot(), bans, d.now(), stats.SummaryOptions{
+		Retention:   d.ledger.Retention(),
+		Geo:         d.geoLookup(),
+		CountryName: geoip.Name,
+	})
 	return control.StatusResponse{
 		Uptime:   d.metrics.Uptime(),
 		Monitors: monitors,
 		Bans:     bans,
 		Stats:    d.metrics.Stats(),
+		History:  &summary,
 	}, nil
 }
 
@@ -657,6 +810,31 @@ func (d *Daemon) Reload(newCfg *config.Config) error {
 	d.rulesMu.Lock()
 	d.rules = newRules
 	d.rulesMu.Unlock()
+
+	// Statistics settings. The listen address is deliberately not reloaded
+	// — rebinding a port is a restart's job, as it is for metrics — but the
+	// ledger's retention and the country database are cheap to swap. The
+	// database is reopened even when the path is unchanged: geoipupdate
+	// refreshes GeoLite2 in place, and `banhammer reload` is how an
+	// operator picks that up without a restart.
+	d.ledger.SetRetention(newCfg.Web.Retention)
+	d.cfgMu.RLock()
+	oldGeoPath := d.cfg.Web.GeoIP
+	d.cfgMu.RUnlock()
+	if db, err := openGeo(newCfg.Web.GeoIP); err != nil {
+		// The rules above were already swapped and are good; the operator
+		// hears about the database and keeps the old one.
+		d.log.Error("reload: keeping the previous web.geoip database", "path", newCfg.Web.GeoIP, "err", err)
+		newCfg.Web.GeoIP = oldGeoPath
+	} else {
+		d.geoMu.Lock()
+		old := d.geo
+		d.geo = db // nil when the key was removed
+		d.geoMu.Unlock()
+		if old != nil {
+			_ = old.Close()
+		}
+	}
 
 	// Atomically swap effective config
 	d.cfgMu.Lock()

@@ -16,6 +16,7 @@ flowchart TD
     cmd["cmd/banhammer<br/>(CLI)"] --> daemon
     cmd --> control
     cmd --> config
+    cmd --> geoip
 
     daemon --> source
     daemon --> rule
@@ -26,10 +27,16 @@ flowchart TD
     daemon --> control
     daemon --> metrics
     daemon --> config
+    daemon --> stats
+    daemon --> geoip
+    daemon --> web
 
     source --> decode
     rule --> decode
     metrics --> control
+    web --> control
+    web --> stats
+    control --> stats
 
     source --> model
     rule --> model
@@ -37,6 +44,7 @@ flowchart TD
     action --> model
     store --> model
     control --> model
+    stats --> model
 ```
 
 `internal/model` is the only package every layer may import, and it imports nothing from this
@@ -47,6 +55,13 @@ never learns what a log line is, and both agree on `model.Ban`.
 > `metrics` importing `control` is the one wart in the graph. `metrics.Registry` builds a
 > `control.Stats` so the daemon can answer `banhammer status` from one place. It means `control`
 > can never import `metrics`; if that ever becomes necessary, move `Stats` down into `model`.
+
+`stats` sits just above `model`: it owns the ban ledger and the `Summary` type that `control`
+carries on the status wire. `geoip` is a leaf that imports nothing; it is handed to `stats` as a
+`Lookup` interface and to `web` as a name function, so neither of those packages knows it exists.
+`web` depends only on `control` (for the response type it renders) and `stats` (for the summary
+it is rendering); it never reaches into the daemon. `cmd` imports `geoip` solely for `geoip.Name`,
+to label country codes in the terminal.
 
 ## Runtime data flow
 
@@ -75,6 +90,8 @@ Each stage exists to make the next one single-threaded or lock-free:
 | Aggregator | exactly one | It owns every `*window.Tracker`. The trackers are therefore not goroutine-safe *by design* — that is what makes them cheap. |
 | Ban manager | caller's goroutine + one expiry goroutine | One mutex over the ban map, the unban heap, the history and the policies. |
 | Executor | exactly one | `iptables` is not concurrency-safe. Serializing here means no backend has to be. |
+| Ledger | — | Appended to from the aggregator (via the ban manager, after its lock is released) and from the control server on a manual ban, which is why `Record` inserts in time order rather than assuming it; read from the control and web servers. One mutex; `Summarize` works on a snapshot so the lock is never held across a computation. |
+| Web | per-connection | Renders from `Status()` like the CLI does, through a 1 s cache, so a flood of page loads costs the aggregator one lock per second. |
 
 ## Cross-package invariants
 
@@ -102,9 +119,21 @@ fired, never the log line. Actions substitute it into `{matched}`, and `bans.jso
 line. If a prefilter ever rejects a line the regex would have matched, that is a missed ban, so
 the property is fuzz-tested rather than merely unit-tested.
 
-**State files are replaceable.** A corrupt, truncated or oversized `bans.json`/`offsets.json` is
-renamed aside as `.corrupt` and the daemon starts fresh. Losing bans is an inconvenience; refusing
-to boot is an outage.
+**State files are replaceable.** A corrupt, truncated or oversized `bans.json`/`offsets.json`/
+`history.json` is renamed aside as `.corrupt` and the daemon starts fresh. Losing bans is an
+inconvenience; refusing to boot is an outage.
+
+**`ban.Recorder` hears about new bans only.** It is called after the manager's lock is released,
+for exactly the bans `MonitorStats.Banned` counts: not for an extension, not for a repeat that
+changes nothing, and not for the bans `Restore` re-applies at startup. The ledger behind the
+status page counts these calls; over-reporting would turn every restart into a fake attack wave.
+
+**The status page is read-only, and `web.secure` is where that is enforced.** Every route is
+wrapped by one handler that sets the security headers and then rejects anything but GET/HEAD, so
+a new route cannot forget them and even a 405 carries them. The template contains no `<script>`
+and no event-handler attribute, and none of html/template's trusted-content types is ever
+constructed; a test greps both the template and the package source to keep it that way. The
+GeoIP database is consulted for display only; nothing in `ban` or `action` can see it.
 
 ## Shutdown order
 
@@ -114,8 +143,8 @@ stopped, and nothing is lost:
 1. Cancel sources, wait for them.
 2. Close the event queue, drain the workers.
 3. Close the match channel, drain the aggregator.
-4. Persist offsets, flush the store.
-5. Stop the control and metrics servers.
+4. Persist offsets and the ban ledger, flush the store.
+5. Stop the control, metrics and status-page servers.
 6. Stop the ban manager.
 7. Stop the executor — it drains its queue with a detached context, so bans enqueued at the last
    moment still reach the firewall.
@@ -142,4 +171,5 @@ A `Daemon` is single-use: step 2 closes channels, so `Run` refuses a second call
 * Repeated errors are rate-limited. A permanently unreadable file must not produce one log line
   per poll.
 * Dependencies: `fsnotify`, `cobra`, `yaml.v3`, `golang.org/x/sys`. Adding one is a design
-  decision, not a convenience.
+  decision, not a convenience. This is why `geoip` carries its own MaxMind DB reader and the
+  status page has no JavaScript framework: neither was worth a dependency edge.

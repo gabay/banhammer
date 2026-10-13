@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"banhammer/internal/model"
+	"banhammer/internal/stats"
 )
 
 type mockService struct {
@@ -1026,5 +1027,54 @@ func TestStatusResponseJSONRoundTrip(t *testing.T) {
 	}
 	if out.Stats != in.Stats {
 		t.Errorf("stats round trip: got %+v, want %+v", out.Stats, in.Stats)
+	}
+}
+
+// TestStatusResponseHistoryRoundTrip pins that the ledger statistics ride
+// along on the status wire format: absent when the daemon has none, and
+// intact — including the typed address and time fields — when it does.
+func TestStatusResponseHistoryRoundTrip(t *testing.T) {
+	without, err := json.Marshal(StatusResponse{})
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if strings.Contains(string(without), `"history"`) {
+		t.Errorf("a response without history must omit the key: %s", without)
+	}
+
+	at := time.Date(2024, 3, 1, 12, 0, 0, 0, time.UTC)
+	ip := netip.MustParseAddr("203.0.113.9")
+	in := StatusResponse{
+		History: &stats.Summary{
+			GeneratedAt: at,
+			Events:      1,
+			Windows:     []stats.Window{{Name: stats.WindowDay, Seconds: 86400, Bans: 1, UniqueIPs: 1}},
+			TopOffenders: []stats.Offender{{
+				IP: ip, Bans: 1, LastAt: at, Country: "DE", Monitors: []string{"sshd"},
+			}},
+			Countries:   []stats.Country{{Code: "DE", Name: "Germany", Bans: 1}},
+			IPCountries: map[string]string{ip.String(): "DE"},
+			GeoEnabled:  true,
+		},
+	}
+	data, err := json.Marshal(in)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	for _, want := range []string{`"history":{`, `"generated_at":"2024-03-01T12:00:00Z"`, `"top_offenders":[{"ip":"203.0.113.9"`, `"by_hour_of_day":[0,0,0`} {
+		if !strings.Contains(string(data), want) {
+			t.Errorf("wire format missing %s in:\n%s", want, data)
+		}
+	}
+
+	var out StatusResponse
+	if err := json.Unmarshal(data, &out); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if out.History == nil {
+		t.Fatal("history lost on the wire")
+	}
+	if !out.History.GeneratedAt.Equal(at) || out.History.TopOffenders[0].IP != ip || out.History.IPCountries[ip.String()] != "DE" {
+		t.Errorf("history round trip: %+v", out.History)
 	}
 }

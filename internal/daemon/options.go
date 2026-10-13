@@ -100,6 +100,17 @@ func WithOffsetInterval(interval time.Duration) Option {
 	}
 }
 
+// WithHistoryInterval sets how often the ban ledger is written to disk when
+// it has changed. The default is a minute; see Daemon.New for why it is
+// slower than the offsets tick.
+func WithHistoryInterval(interval time.Duration) Option {
+	return func(d *Daemon) {
+		if interval > 0 {
+			d.historyInterval = interval
+		}
+	}
+}
+
 // WithSweepInterval sets the interval for periodic sliding-window tracker sweeps.
 func WithSweepInterval(interval time.Duration) Option {
 	return func(d *Daemon) {

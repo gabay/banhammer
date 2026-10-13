@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+{{if .Refresh}}<meta http-equiv="refresh" content="{{.Refresh}}">{{end}}
+<title>banhammer · status</title>
+<style>
+:root{
+  --bg:#0f1115;--panel:#171a21;--panel2:#1d212b;--fg:#e6e8ee;--muted:#8b93a7;--line:#262b36;
+  --accent:#ff7a45;--accent2:#ffb38a;--ok:#4cd37b;--warn:#ffcc4d;--bad:#ff5c5c;--bar:#ff7a45;--barcur:#ffd3bd;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  --sans:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+}
+@media (prefers-color-scheme: light){
+  :root{--bg:#f6f7f9;--panel:#ffffff;--panel2:#f0f2f6;--fg:#1a1d24;--muted:#5f6778;--line:#e2e5ec;
+    --bar:#e8622a;--barcur:#9a3a0f;--accent:#e8622a;--accent2:#b84d1f}
+}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 var(--sans)}
+a{color:inherit}
+main{max-width:1180px;margin:0 auto;padding:20px 18px 40px}
+header{display:flex;flex-wrap:wrap;align-items:baseline;gap:8px 18px;margin-bottom:16px}
+header h1{font-size:22px;margin:0;letter-spacing:.3px}
+header h1 span{color:var(--accent)}
+header .meta{color:var(--muted);font-size:13px}
+.warn{background:color-mix(in srgb,var(--warn) 18%,var(--panel));border:1px solid var(--warn);border-radius:8px;padding:8px 12px;margin:0 0 14px;font-size:13px}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(128px,1fr));gap:10px;margin-bottom:16px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
+.card .v{font-size:26px;font-weight:650;font-variant-numeric:tabular-nums;line-height:1.1}
+.card .l{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.6px;margin-top:4px}
+.card .s{color:var(--muted);font-size:12px;margin-top:2px}
+.card.bad .v{color:var(--bad)}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}
+@media (max-width:820px){.grid{grid-template-columns:1fr}}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px 14px 10px;min-width:0}
+.panel h2{font-size:13px;margin:0 0 10px;color:var(--muted);text-transform:uppercase;letter-spacing:.6px;font-weight:600;display:flex;justify-content:space-between;gap:8px}
+.panel h2 b{color:var(--fg);font-weight:600;text-transform:none;letter-spacing:0}
+.chart{display:flex;align-items:flex-end;gap:2px;height:110px;border-bottom:1px solid var(--line);padding-bottom:2px}
+.chart .b{flex:1 1 0;min-width:2px;background:var(--bar);border-radius:2px 2px 0 0;position:relative;opacity:.9}
+.chart .b.cur{background:var(--barcur)}
+.chart .b.z{background:transparent;border-bottom:2px solid var(--line)}
+.axis{display:flex;gap:2px;margin-top:4px;color:var(--muted);font-size:11px;font-variant-numeric:tabular-nums}
+.axis span{flex:1 1 0;min-width:0;text-align:left;white-space:nowrap;overflow:visible}
+.empty{color:var(--muted);font-size:13px;padding:8px 0}
+table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);white-space:nowrap}
+th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.5px}
+td.num,th.num{text-align:right}
+td.ip{font-family:var(--mono)}
+td.mono{font-family:var(--mono);color:var(--muted);max-width:360px;overflow:hidden;text-overflow:ellipsis}
+td.dim{color:var(--muted)}
+.tw{overflow-x:auto}
+.hbars{display:grid;grid-template-columns:auto 1fr auto;gap:6px 10px;align-items:center;font-size:13px}
+.hbars .n{font-variant-numeric:tabular-nums;text-align:right;color:var(--muted)}
+.hbars .t{display:flex;gap:6px;align-items:center;white-space:nowrap}
+.hbars .t code{font-family:var(--mono);color:var(--muted);font-size:12px}
+.hbars .r{height:10px;background:var(--panel2);border-radius:5px;overflow:hidden}
+.hbars .r i{display:block;height:100%;background:var(--bar)}
+footer{color:var(--muted);font-size:12px;margin-top:18px;display:flex;flex-wrap:wrap;gap:6px 16px}
+.flag{font-size:15px;line-height:1}
+.pill{display:inline-block;padding:1px 7px;border-radius:999px;background:var(--panel2);color:var(--muted);font-size:11px}
+</style>
+</head>
+<body>
+<main>
+<header>
+  <h1><span>⚒</span> banhammer</h1>
+  <div class="meta">up {{.Uptime}} · generated {{.GeneratedAt}} {{.Timezone}}{{if .Refresh}} · refreshes every {{.Refresh}}s{{end}} · read-only</div>
+</header>
+
+{{range .Warn}}<p class="warn">⚠ {{.}}</p>{{end}}
+
+<section class="cards">
+{{range .Cards}}  <div class="card{{if .Warn}} bad{{end}}"><div class="v">{{.Value}}</div><div class="l">{{.Label}}</div>{{if .Sub}}<div class="s">{{.Sub}}</div>{{end}}</div>
+{{end}}</section>
+
+{{if .HasHistory}}
+<section class="grid">
+  <div class="panel">
+    <h2>Bans per hour · last 24h <b>{{n .Hourly.Total}}</b></h2>
+    {{template "chart" .Hourly}}
+  </div>
+  <div class="panel">
+    <h2>Bans per day · last 30d <b>{{n .Daily.Total}}</b></h2>
+    {{template "chart" .Daily}}
+  </div>
+</section>
+<section class="grid">
+  <div class="panel">
+    <h2>By hour of day · {{.Retention}} <b>{{.Timezone}}</b></h2>
+    {{template "chart" .HourOfDay}}
+  </div>
+  <div class="panel">
+    <h2>By day of week · {{.Retention}}</h2>
+    {{template "chart" .Weekday}}
+  </div>
+</section>
+<section class="grid">
+  <div class="panel">
+    <h2>Countries · active bans</h2>
+    {{if not .GeoEnabled}}<p class="empty">No country database configured. Set <code>web.geoip</code> to a GeoLite2/DB-IP country database to see where offenders come from.</p>
+    {{else if not .ActiveCountries}}<p class="empty">No active bans.</p>
+    {{else}}{{template "countries" .ActiveCountries}}{{end}}
+  </div>
+  <div class="panel">
+    <h2>Countries · last {{.Retention}}</h2>
+    {{if not .GeoEnabled}}<p class="empty">Geography is off.</p>
+    {{else if not .AllCountries}}<p class="empty">No bans recorded yet.</p>
+    {{else}}{{template "countries" .AllCountries}}{{end}}
+  </div>
+</section>
+{{end}}
+
+<section class="panel" style="margin-bottom:12px">
+  <h2>Monitors</h2>
+  {{if not .Monitors}}<p class="empty">No monitors.</p>{{else}}
+  <div class="tw"><table>
+    <tr><th>Name</th><th>Type</th><th>Target</th><th class="num">Tracked IPs</th>{{if .HasHistory}}<th class="num">Active</th><th class="num">24h</th><th class="num">7d</th><th class="num">30d</th>{{end}}</tr>
+    {{range .Monitors}}<tr><td>{{.Name}}</td><td class="dim">{{.Type}}</td><td class="mono" title="{{.Target}}">{{.Target}}</td><td class="num">{{n .Tracked}}</td>{{if .HasHistory}}<td class="num">{{n .Active}}</td><td class="num">{{n .Day}}</td><td class="num">{{n .Week}}</td><td class="num">{{n .Month}}</td>{{end}}</tr>
+    {{end}}
+  </table></div>{{end}}
+</section>
+
+{{if .HasHistory}}
+<section class="panel" style="margin-bottom:12px">
+  <h2>Repeat offenders · last {{.Retention}} <b>{{n .RepeatOffenders}} of {{n .UniqueOffenders}} addresses banned more than once</b></h2>
+  {{if not .Offenders}}<p class="empty">No bans recorded yet.</p>{{else}}
+  <div class="tw"><table>
+    <tr><th>Address</th>{{if $.GeoEnabled}}<th>Country</th>{{end}}<th class="num">Bans</th><th>Last banned</th><th>Monitors</th></tr>
+    {{range .Offenders}}<tr><td class="ip">{{.IP}}</td>{{if $.GeoEnabled}}<td>{{if .Flag}}<span class="flag">{{.Flag}}</span> {{end}}{{if .Country}}{{.Country}}{{else}}{{.Code}}{{end}}</td>{{end}}<td class="num">{{n .Bans}}</td><td>{{.LastAt}} <span class="pill">{{.LastAgo}}</span></td><td class="dim">{{.Monitors}}</td></tr>
+    {{end}}
+  </table></div>{{end}}
+</section>
+{{end}}
+
+<section class="panel">
+  <h2>Active bans <b>{{n .BansTotal}}</b></h2>
+  {{if not .Bans}}<p class="empty">Nobody is banned right now.</p>{{else}}
+  <div class="tw"><table>
+    <tr><th>Address</th>{{if .GeoEnabled}}<th>Country</th>{{end}}<th>Monitor</th><th class="num">Offense</th><th class="num">Hits</th><th>Banned at</th><th>Expires</th><th>Rule</th></tr>
+    {{range .Bans}}<tr><td class="ip">{{.IP}}</td>{{if $.GeoEnabled}}<td>{{if .Flag}}<span class="flag">{{.Flag}}</span> {{end}}{{if .Country}}{{.Country}}{{else}}{{.Code}}{{end}}</td>{{end}}<td>{{.Monitor}}</td><td class="num">{{.Offense}}</td><td class="num">{{.Count}}</td><td>{{.At}}</td><td>{{.Expires}}</td><td class="mono" title="{{.Matched}}">{{.Matched}}</td></tr>
+    {{end}}
+  </table></div>
+  {{if .BansOmitted}}<p class="empty">… and {{n .BansOmitted}} more, by expiry. The full list is at <code>/status.json</code> and in <code>banhammer status</code>.</p>{{end}}{{end}}
+</section>
+
+<footer>
+  <span>banhammer status page</span>
+  {{if .HasHistory}}<span>ledger: {{n .Events}} events · retention {{.Retention}}</span>{{end}}
+  <span>times in {{.Timezone}}</span>
+  <span>this page is read-only; use <code>banhammer ban/unban</code> on the host</span>
+</footer>
+</main>
+</body>
+</html>
+
+{{define "chart"}}{{if eq .Max 0}}<div class="chart">{{range .Bars}}<div class="b z" title="{{.Title}}"></div>{{end}}</div>{{else}}<div class="chart">{{range .Bars}}<div class="b{{if .Current}} cur{{end}}{{if eq .Value 0}} z{{end}}" style="height:{{.Pct}}%" title="{{.Title}}"></div>{{end}}</div>{{end}}<div class="axis">{{range .Bars}}<span>{{.Label}}</span>{{end}}</div>{{end}}
+
+{{define "countries"}}<div class="hbars">{{range .}}<div class="t">{{if .Flag}}<span class="flag">{{.Flag}}</span>{{end}}<span>{{.Name}}</span><code>{{.Code}}</code></div><div class="r"><i style="width:{{.Pct}}%"></i></div><div class="n">{{n .Bans}}</div>{{end}}</div>{{end}}

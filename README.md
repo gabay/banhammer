@@ -27,6 +27,7 @@ monitors:
 * **Flexible Backends:** Built-in support for `iptables` (with automatic IPv4/IPv6 segregation), `nftables`, `ipset` (scales to 100k+ bans), and custom shell command templates (`cmd`).
 * **Resilient Persistence:** Survives daemon restarts without replay loops; persists active bans and source read offsets atomically.
 * **Built-in CLI Tooling:** Interactive rule tester (`test`), strict config validator (`check`), live status query (`status`), manual ban/unban commands, and dynamic configuration reloads.
+* **Ban Statistics & Status Page:** A 30-day ban ledger behind `banhammer status` and an optional read-only, zero-JavaScript web dashboard — bans per hour/day, hour-of-day and weekday patterns, repeat offenders and (with a GeoIP database) country distribution.
 
 ---
 
@@ -206,11 +207,28 @@ banhammer test -c /etc/banhammer/config.yaml -m sshd -f /var/log/auth.log --rate
 * `--rate`: Simulated time step advanced per log line (default `1s`).
 
 ### `status` — Live Daemon Telemetry
-Queries the active daemon for uptime, pipeline metrics (lines read, dropped, matched), monitor status, tracked IPs, and the list of active bans.
+Queries the active daemon for uptime, pipeline metrics (lines read, dropped, matched), monitor status, tracked IPs, the list of active bans, and the ban history: bans and unique addresses over the last 1h / 24h / 7d / 30d, a per-monitor breakdown, the top repeat offenders, top countries (when a GeoIP database is configured, see [Status Page](#status-page--ban-statistics)) and a sparkline of the last 24 hours and 30 days.
 
 ```bash
 banhammer status
 banhammer status --json
+```
+
+```
+History (last 30d, 412 events):
+  WINDOW  BANS  UNIQUE IPS
+  1h      3     3
+  24h     57    49
+  7d      188   151
+  30d     412   302
+  Repeat offenders: 61 of 302 addresses banned more than once
+
+  Top offenders:
+    IP              COUNTRY        BANS  LAST BANNED          MONITORS
+    203.0.113.77    Germany (DE)   9     2026-10-13 03:12:40  sshd
+    ...
+
+  Last 24h: ▁▂▁ ▁▁▃█▅▂▁  ▁▁▂▁ ▁▁▂▃▂▁▁  (57 bans, peak 11/h)
 ```
 
 ### `ban` — Manually Ban an IP
@@ -271,6 +289,63 @@ scrape_configs:
     static_configs:
       - targets: ["127.0.0.1:9090"]
 ```
+
+---
+
+## Status Page & Ban Statistics
+
+Banhammer keeps a bounded **ban ledger** — every ban it issues, for the last 30 days by default — and can serve a small read-only dashboard from it:
+
+```yaml
+web:
+  enabled: true                  # off by default
+  listen: 127.0.0.1:7980         # default
+  geoip: /usr/share/GeoIP/GeoLite2-Country.mmdb   # optional
+  retention: 720h                # default: 30 days
+```
+
+Then open <http://127.0.0.1:7980/>.
+
+![Status page](docs/status-page.png)
+
+### What it shows
+
+| Section | Source |
+|---|---|
+| Active bans (IPv4/IPv6 split), bans + unique addresses over the last 24h / 7d / 30d, pipeline counters | live ban table + ledger |
+| Bans per hour (last 24h) and per day (last 30d) | ledger |
+| Hour-of-day and day-of-week distribution, in the daemon's local time zone | ledger |
+| Countries of the active bans and of the last 30 days | ledger + GeoIP database |
+| Per-monitor table: tracked IPs, active, 24h / 7d / 30d | live + ledger |
+| Repeat offenders: most-banned addresses, last ban, which monitors caught them | ledger |
+| Active bans with country, offense number, hit count, expiry and the rule that fired | live ban table |
+
+The same data is available as JSON at `/status.json` (identical to `banhammer status --json`), and `/healthz` answers `200 ok` for liveness probes.
+
+### Security posture
+
+The page is designed to be safe to leave running on a security daemon:
+
+* **Read-only by construction.** There are no forms, no actions and no JavaScript — the HTML is rendered on the server, charts are plain CSS, and the page refreshes itself with a `<meta refresh>`. It cannot ban, unban or reload anything; use the CLI on the host for that.
+* **Only `GET` and `HEAD`** are answered; every other method gets `405`. Unknown paths get `404`.
+* A strict `Content-Security-Policy` (`default-src 'none'`) plus `X-Frame-Options: DENY`, `nosniff`, `Referrer-Policy: no-referrer` and `Cache-Control: no-store` on every response. All dynamic values pass through `html/template`.
+* Rendered output is cached for one second, so a request flood costs one status snapshot per second, not one per request.
+* **Loopback by default.** The page lists every banned address and every watched log path, which is useful reconnaissance; it binds to `127.0.0.1` unless you say otherwise. To reach it from elsewhere, set `listen: 0.0.0.0:7980` and put it behind a reverse proxy that handles TLS and authentication, or tunnel to it (`ssh -L 7980:127.0.0.1:7980 host`).
+
+### Geography (optional)
+
+Set `web.geoip` to a country database and the page (and `banhammer status`) gain country columns and charts. Two formats are read, chosen by file extension, with no external dependency:
+
+* **MaxMind DB** (`.mmdb`): [GeoLite2-Country](https://dev.maxmind.com/geoip/geolite2-free-geolocation-data) (free with an account; `geoipupdate` keeps it fresh at `/usr/share/GeoIP/GeoLite2-Country.mmdb`), GeoIP2-Country, or the [DB-IP country mmdb](https://db-ip.com/db/download/ip-to-country-lite).
+* **CSV** (`start_ip,end_ip,country_code`, optionally `.gz`): [DB-IP Country Lite](https://db-ip.com/db/download/ip-to-country-lite) or the daily-updated files in [sapics/ip-location-db](https://github.com/sapics/ip-location-db) (e.g. `dbip-country/dbip-country-ipv4.csv` + `-ipv6.csv` concatenated, or `geolite2-country`).
+
+The database is only ever consulted for display. It is never involved in a ban decision, and a missing or corrupt file fails startup with a clear error rather than silently showing nothing. `banhammer reload` reopens the database (so a `geoipupdate` refresh is picked up without a restart) and applies a changed `retention`; changing `listen` needs a restart.
+
+### The ledger
+
+Ban events are kept in memory (64 bytes each, capped at 100 000 events regardless of `retention`) and persisted to `<state_dir>/history.json` once a minute when anything changed, and at shutdown, so a restart does not blank the charts. Like the other state files it is replaceable: a corrupt file is set aside as `history.json.corrupt` and the daemon starts with an empty ledger. Only *new* bans are recorded — a ban re-applied at startup, or extended while live, does not count twice.
+
+The page shows at most 500 active bans (soonest to expire first) and says how many more there are; `/status.json` and `banhammer status` always list all of them.
 
 ---
 

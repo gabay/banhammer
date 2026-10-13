@@ -4,6 +4,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestValidateSource(t *testing.T) {
@@ -296,6 +297,13 @@ func TestGlobalValidation(t *testing.T) {
 		{name: "state_dir", src: "state_dir: \"\"\n" + monitor, err: "state_dir must not be empty"},
 		{name: "metrics listen", src: "metrics:\n  listen: 9777\n" + monitor, err: `metrics.listen: "9777" must be host:port`},
 		{name: "metrics port", src: "metrics:\n  listen: 127.0.0.1:0\n" + monitor, err: `has an invalid port "0"`},
+		{name: "web listen", src: "web:\n  listen: 7980\n" + monitor, err: `web.listen: "7980" must be host:port`},
+		{name: "web listen blank", src: "web:\n  listen: \"\"\n" + monitor, err: "web.listen is blank"},
+		{name: "web geoip blank", src: "web:\n  geoip: \"  \"\n" + monitor, err: "web.geoip is blank"},
+		{name: "web retention", src: "web:\n  retention: 0s\n" + monitor, err: "web.retention must be greater than zero, got 0s"},
+		{name: "web unknown key", src: "web:\n  enable: true\n" + monitor, err: `unknown key "enable" in web (did you mean "enabled"?)`},
+		{name: "web and metrics clash", src: "metrics:\n  listen: 127.0.0.1:7980\nweb:\n  enabled: true\n" + monitor, err: `metrics.listen and web.listen are both "127.0.0.1:7980"`},
+		{name: "web and monitor clash", src: "web:\n  enabled: true\nmonitors:\n  m:\n    listen: tcp://127.0.0.1:7980\n    match: \"<IP>\"\n", err: `monitor "m" listens on "tcp://127.0.0.1:7980", the same address as web.listen`},
 		{name: "no monitors", src: "state_dir: /tmp\n", err: "no monitors defined: nothing would be watched"},
 	}
 	for _, tc := range tests {
@@ -314,6 +322,34 @@ func TestGlobalValidation(t *testing.T) {
 	c := mustParse(t, "metrics:\n  listen: 127.0.0.1:9777\n"+monitor)
 	if c.Metrics.Listen != "127.0.0.1:9777" {
 		t.Errorf("Metrics.Listen = %q", c.Metrics.Listen)
+	}
+}
+
+// TestWebDefaults pins the status page's defaults: off, loopback on the
+// well-known port, thirty days of history. `enabled: true` alone must be a
+// complete configuration, because a default port that still has to be typed
+// is not a default.
+func TestWebDefaults(t *testing.T) {
+	t.Parallel()
+
+	const monitor = "monitors:\n  m:\n    stdin: true\n    match: \"<IP>\"\n"
+
+	c := mustParse(t, monitor)
+	want := Web{Enabled: false, Listen: DefaultWebListen, Retention: DefaultWebRetention}
+	if c.Web != want {
+		t.Errorf("absent web block: got %+v, want %+v", c.Web, want)
+	}
+
+	c = mustParse(t, "web:\n  enabled: true\n"+monitor)
+	want.Enabled = true
+	if c.Web != want {
+		t.Errorf("enabled only: got %+v, want %+v", c.Web, want)
+	}
+
+	c = mustParse(t, "web:\n  enabled: true\n  listen: 0.0.0.0:8080\n  geoip: /usr/share/GeoIP/GeoLite2-Country.mmdb\n  retention: 24h\n"+monitor)
+	want = Web{Enabled: true, Listen: "0.0.0.0:8080", GeoIP: "/usr/share/GeoIP/GeoLite2-Country.mmdb", Retention: 24 * time.Hour}
+	if c.Web != want {
+		t.Errorf("full block: got %+v, want %+v", c.Web, want)
 	}
 }
 

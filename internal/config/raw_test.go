@@ -129,7 +129,7 @@ func TestKnownKeysMatchStructTags(t *testing.T) {
 	want := map[string][]string{
 		"config.rawConfig": {
 			"allow_local", "allowlist", "defaults", "log_format", "metrics",
-			"monitors", "queue_size", "state_dir",
+			"monitors", "queue_size", "state_dir", "web",
 		},
 		"config.rawSettings": {
 			"action", "bantime", "bantime_factor", "bantime_max", "find_history",
@@ -143,6 +143,7 @@ func TestKnownKeysMatchStructTags(t *testing.T) {
 		},
 		"config.rawMetrics": {"listen"},
 		"config.rawAction":  {"ban", "chain", "flush_on_exit", "name", "shell", "start", "stop", "timeout", "unban"},
+		"config.rawWeb":     {"enabled", "geoip", "listen", "retention"},
 	}
 
 	got := keyIndex()

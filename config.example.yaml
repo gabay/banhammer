@@ -36,6 +36,19 @@ allowlist:
 # metrics:
 #   listen: 127.0.0.1:9777         # Prometheus endpoint (/metrics, /healthz); omit to disable
 
+# web:                             # read-only status page with ban statistics
+#   enabled: true                  # off by default
+#   listen: 127.0.0.1:7980         # default; use 0.0.0.0:7980 to reach it from elsewhere
+#                                  # (the page lists banned addresses and watched log
+#                                  # paths — put a reverse proxy with auth in front)
+#   geoip: /usr/share/GeoIP/GeoLite2-Country.mmdb
+#                                  # optional country database for the geography charts:
+#                                  # a MaxMind .mmdb (GeoLite2/GeoIP2/DB-IP country) or a
+#                                  # start_ip,end_ip,country_code CSV (dbip-country-lite,
+#                                  # sapics/ip-location-db); .csv.gz is fine
+#   retention: 720h                # how long ban events are kept for the statistics
+#                                  # (also what `banhammer status` reports); 30 days
+
 # ---------------------------------------------------------------- monitors
 monitors:
 

@@ -32,9 +32,13 @@ import (
 )
 
 const (
-	// BansFile and OffsetsFile are the two state files inside the state dir.
+	// BansFile, OffsetsFile and HistoryFile are the state files inside the
+	// state dir.
 	BansFile    = "bans.json"
 	OffsetsFile = "offsets.json"
+	// HistoryFile holds the ban ledger behind the status page's statistics.
+	// It is the one state file whose loss costs nothing but a chart.
+	HistoryFile = "history.json"
 
 	// CorruptSuffix is appended to a state file that could not be parsed.
 	CorruptSuffix = ".corrupt"
@@ -418,6 +422,76 @@ func (s *Store) SaveOffsets(offsets map[string]model.Checkpoint) error {
 	return nil
 }
 
+// LoadHistory returns the persisted ban ledger. Like LoadBans, a corrupt or
+// missing file yields no events and no error: the statistics page is the
+// least important thing the daemon does, and must never be the reason it
+// fails to start. Entries are returned as written; retention is the ledger's
+// business.
+func (s *Store) LoadHistory() ([]model.BanEvent, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return nil, fmt.Errorf("store: LoadHistory: %w", ErrClosed)
+	}
+	var file historyFile
+	ok, err := s.readState(HistoryFile, &file)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, nil
+	}
+	return s.validEvents(file.Events, HistoryFile), nil
+}
+
+// SaveHistory persists the ban ledger atomically. It is synchronous and not
+// debounced, like SaveOffsets: the daemon already calls it on a slow tick and
+// at shutdown, and a write that fails should say so to that caller. The slice
+// is not retained.
+func (s *Store) SaveHistory(events []model.BanEvent) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return fmt.Errorf("store: SaveHistory: %w", ErrClosed)
+	}
+	clean := s.validEvents(events, "SaveHistory")
+	if clean == nil {
+		clean = []model.BanEvent{} // encode as [], not null
+	}
+	data, err := marshalState(historyFile{
+		envelope: envelope{Version: stateVersion},
+		Events:   clean,
+	})
+	if err != nil {
+		return fmt.Errorf("store: encode %s: %w", HistoryFile, err)
+	}
+	if err := s.writeFile(s.dir, HistoryFile, data); err != nil {
+		return saveError(HistoryFile, err)
+	}
+	return nil
+}
+
+// validEvents is validBans' counterpart for the ledger: an event without a
+// usable address or timestamp can feed no statistic, and dropping it on both
+// the save and the load path keeps the two in agreement. The result never
+// aliases the input.
+func (s *Store) validEvents(events []model.BanEvent, origin string) []model.BanEvent {
+	kept := events[:0:0]
+	dropped := 0
+	for _, e := range events {
+		if !e.IP.IsValid() || e.At.IsZero() {
+			dropped++
+			continue
+		}
+		kept = append(kept, e)
+	}
+	if dropped > 0 {
+		s.log.Warn("dropped unusable ban history entries", "origin", origin,
+			"dropped", dropped, "kept", len(kept))
+	}
+	return kept
+}
+
 // Lookup returns the checkpoint recorded for a file path, implementing
 // source.CheckpointLookup.
 //
@@ -756,6 +830,11 @@ type offsetsFile struct {
 	Offsets map[string]model.Checkpoint `json:"offsets"`
 }
 
+type historyFile struct {
+	envelope
+	Events []model.BanEvent `json:"events"`
+}
+
 // readState reads and decodes a state file. It reports ok=false (with a nil
 // error) when the file is absent, empty, oversized, unparseable or of an
 // unknown version; in the latter four cases the file is quarantined first. A
@@ -832,7 +911,7 @@ func (s *Store) sweepTempFiles() {
 		if de.IsDir() {
 			continue
 		}
-		if !strings.HasPrefix(name, BansFile+tempPrefix) && !strings.HasPrefix(name, OffsetsFile+tempPrefix) {
+		if !strings.HasPrefix(name, BansFile+tempPrefix) && !strings.HasPrefix(name, OffsetsFile+tempPrefix) && !strings.HasPrefix(name, HistoryFile+tempPrefix) {
 			continue
 		}
 		if err := os.Remove(filepath.Join(s.dir, name)); err != nil {

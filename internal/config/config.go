@@ -40,6 +40,16 @@ const (
 	defaultActionTimeout = 10 * time.Second
 	// commandAction is the backend name implied by inline command templates.
 	commandAction = "cmd"
+
+	// DefaultWebListen is where the status page binds when `web.enabled` is
+	// set without a `listen`. Loopback, not 0.0.0.0: the page lists every
+	// banned address and every watched log path, which is reconnaissance for
+	// anyone who can reach it. Exposing it is a decision the operator makes by
+	// writing an address down.
+	DefaultWebListen = "127.0.0.1:7980"
+	// DefaultWebRetention is how far back the ban ledger behind the status
+	// page remembers. Thirty days is the longest window the page reports.
+	DefaultWebRetention = 30 * 24 * time.Hour
 )
 
 // maxQueueSize is the largest queue_size accepted.
@@ -58,6 +68,7 @@ type Config struct {
 	AllowLocal bool   // default true
 	Allowlist  []netip.Prefix
 	Metrics    Metrics
+	Web        Web
 	QueueSize  int                 // default 8192
 	Defaults   Settings            // the effective defaults, after built-ins
 	Monitors   map[string]*Monitor // key = monitor name
@@ -68,6 +79,18 @@ type Config struct {
 // benchmarks do) can name the thing it is assigning.
 type Metrics struct {
 	Listen string // host:port; empty disables the endpoint
+}
+
+// Web is the optional read-only status page.
+//
+// Unlike Metrics it has an explicit Enabled switch rather than "set listen to
+// turn it on": the page has a well-known default port, and the point of a
+// default port is that turning the feature on should not require choosing one.
+type Web struct {
+	Enabled   bool
+	Listen    string        // host:port; default DefaultWebListen
+	GeoIP     string        // path to a country database; empty disables geography
+	Retention time.Duration // how long ban events are kept for statistics; default 30d
 }
 
 // Settings are the knobs that may appear under `defaults:` or on a monitor.
@@ -287,6 +310,13 @@ func resolve(raw *rawConfig) *Config {
 	setNum(&c.QueueSize, raw.QueueSize)
 	if raw.Metrics != nil {
 		setIf(&c.Metrics.Listen, raw.Metrics.Listen)
+	}
+	c.Web = Web{Listen: DefaultWebListen, Retention: DefaultWebRetention}
+	if raw.Web != nil {
+		setIf(&c.Web.Enabled, raw.Web.Enabled)
+		setIf(&c.Web.Listen, raw.Web.Listen)
+		setIf(&c.Web.GeoIP, raw.Web.GeoIP)
+		setDur(&c.Web.Retention, raw.Web.Retention)
 	}
 	if len(raw.Allowlist) > 0 {
 		c.Allowlist = make([]netip.Prefix, 0, len(raw.Allowlist))

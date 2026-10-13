@@ -19,6 +19,9 @@ the Python runtime, the `.conf`/`.local` inheritance maze, or the per-jail proce
 
 ### Non-Goals (v1)
 * No web UI, no database, no clustering/ban-sharing between hosts.
+  *(Amended after v1: a read-only status **page** was added — one server-rendered HTML page of
+  ban statistics, no JavaScript, no actions. The non-goal still stands for anything interactive:
+  banning, unbanning and reloading remain CLI-only, over the Unix socket.)*
 * No packet inspection — Banhammer only reads logs.
 * No `fail2ban` filter/action file compatibility (we will ship a converter *hint* table, not a parser).
 * No Windows support. Linux first, BSD best-effort.

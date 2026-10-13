@@ -99,6 +99,7 @@ func validate(c *Config, raw *rawConfig) []problem {
 			add(globalOrigin(), fmt.Errorf("metrics.listen: %w", err))
 		}
 	}
+	add(globalOrigin(), checkWeb(c.Web, raw.Web)...)
 	if len(c.Monitors) == 0 {
 		add(globalOrigin(), errors.New("no monitors defined: nothing would be watched"))
 	}
@@ -114,6 +115,29 @@ func validate(c *Config, raw *rawConfig) []problem {
 		add(monitorOrigin(name), checkMonitor(c.Monitors[name], raw.Monitors[name])...)
 	}
 	return problems
+}
+
+// checkWeb validates the status page block.
+//
+// The block is checked even when the page is disabled: a half-written block
+// that will be enabled next week is cheaper to fix now, and `banhammer check`
+// is where typos are supposed to surface.
+func checkWeb(w Web, rw *rawWeb) []error {
+	var errs []error
+	if rw != nil && rw.Listen != nil && strings.TrimSpace(*rw.Listen) == "" {
+		errs = append(errs, errors.New("web.listen is blank: give host:port, or drop the key for the default"))
+	} else if w.Listen != "" {
+		if err := checkHostPort(w.Listen); err != nil {
+			errs = append(errs, fmt.Errorf("web.listen: %w", err))
+		}
+	}
+	if rw != nil && rw.GeoIP != nil && strings.TrimSpace(*rw.GeoIP) == "" {
+		errs = append(errs, errors.New("web.geoip is blank: give the path to a country database, or drop the key"))
+	}
+	if w.Retention <= 0 {
+		errs = append(errs, fmt.Errorf("web.retention must be greater than zero, got %s", fmtDur(w.Retention)))
+	}
+	return errs
 }
 
 // checkSourceConflicts reports monitors that would fight over one input.
@@ -145,6 +169,26 @@ func checkSourceConflicts(c *Config) []error {
 	for _, addr := range slices.Sorted(maps.Keys(byListen)) {
 		if names := byListen[addr]; len(names) > 1 {
 			errs = append(errs, fmt.Errorf("monitors %s all listen on %q, but only one of them can bind it", list(names), addr))
+		}
+	}
+
+	// The two HTTP endpoints clash more quietly still: a failed bind is one
+	// error line in the journal and a page that is simply never there.
+	if c.Metrics.Listen != "" && c.Web.Enabled && c.Metrics.Listen == c.Web.Listen {
+		errs = append(errs, fmt.Errorf("metrics.listen and web.listen are both %q; give them different ports", c.Web.Listen))
+	}
+	for _, name := range c.MonitorNames() {
+		m := c.Monitors[name]
+		if m.Listen == "" {
+			continue
+		}
+		if _, rest, ok := strings.Cut(m.Listen, "://"); ok && strings.HasPrefix(m.Listen, "tcp://") {
+			switch {
+			case c.Metrics.Listen != "" && rest == c.Metrics.Listen:
+				errs = append(errs, fmt.Errorf("monitor %q listens on %q, the same address as metrics.listen", name, m.Listen))
+			case c.Web.Enabled && rest == c.Web.Listen:
+				errs = append(errs, fmt.Errorf("monitor %q listens on %q, the same address as web.listen", name, m.Listen))
+			}
 		}
 	}
 	return errs

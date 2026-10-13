@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"banhammer/internal/model"
+	"banhammer/internal/stats"
 )
 
 // Sentinel errors representing control-plane failure states.
@@ -92,6 +93,11 @@ type StatusResponse struct {
 	Monitors []MonitorStatus `json:"monitors"`
 	Bans     []model.Ban     `json:"bans"`
 	Stats    Stats           `json:"stats"`
+	// History is the ledger-derived statistics (bans per window, timelines,
+	// top offenders, geography). It is a pointer because a daemon without a
+	// ledger — `banhammer test`, or a mock in a CLI test — has nothing to
+	// say, and an absent key reads better than a block of zeros.
+	History *stats.Summary `json:"history,omitempty"`
 }
 
 // MarshalJSON keeps the wire format readable and symmetric with

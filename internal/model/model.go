@@ -57,6 +57,24 @@ type Ban struct {
 // Expired reports whether the ban's term has elapsed as of now.
 func (b Ban) Expired(now time.Time) bool { return !now.Before(b.Until) }
 
+// BanEvent is the durable record that a ban was issued: who, by which monitor,
+// and when. It is what the statistics ledger keeps once the ban itself has
+// expired and been forgotten by the ban manager.
+//
+// It is deliberately a projection of Ban rather than the Ban itself: a ledger
+// entry lives for weeks, so every field costs memory for weeks, and nothing a
+// statistic needs is lost by dropping the expiry and the hit count.
+type BanEvent struct {
+	IP      netip.Addr `json:"ip"`
+	Monitor string     `json:"monitor"`
+	At      time.Time  `json:"at"`
+}
+
+// Event converts a ban into its ledger record.
+func (b Ban) Event() BanEvent {
+	return BanEvent{IP: b.IP, Monitor: b.Monitor, At: b.At}
+}
+
 // Family returns the address family of the banned IP, as used to pick between
 // iptables and ip6tables.
 func (b Ban) Family() Family {

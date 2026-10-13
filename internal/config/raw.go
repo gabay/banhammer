@@ -25,6 +25,7 @@ type rawConfig struct {
 	AllowLocal *bool                  `yaml:"allow_local"`
 	Allowlist  []rawPrefix            `yaml:"allowlist"`
 	Metrics    *rawMetrics            `yaml:"metrics"`
+	Web        *rawWeb                `yaml:"web"`
 	QueueSize  *intVal                `yaml:"queue_size"`
 	Defaults   *rawSettings           `yaml:"defaults"`
 	Monitors   map[string]*rawMonitor `yaml:"monitors"`
@@ -32,6 +33,14 @@ type rawConfig struct {
 
 type rawMetrics struct {
 	Listen *string `yaml:"listen"`
+}
+
+// rawWeb is the `web:` block: the optional read-only status page.
+type rawWeb struct {
+	Enabled   *bool     `yaml:"enabled"`
+	Listen    *string   `yaml:"listen"`
+	GeoIP     *string   `yaml:"geoip"`
+	Retention *duration `yaml:"retention"`
 }
 
 // rawSettings is the set of knobs valid both under `defaults:` and directly on
@@ -409,6 +418,7 @@ var typeLabels = map[string]string{
 	"config.rawSettings": "defaults",
 	"config.rawMonitor":  "a monitor",
 	"config.rawMetrics":  "metrics",
+	"config.rawWeb":      "web",
 	"config.rawAction":   "an action",
 }
 
@@ -420,6 +430,7 @@ var keyIndex = sync.OnceValue(func() map[string][]string {
 		reflect.TypeFor[rawSettings](),
 		reflect.TypeFor[rawMonitor](),
 		reflect.TypeFor[rawMetrics](),
+		reflect.TypeFor[rawWeb](),
 		reflect.TypeFor[rawAction](),
 	}
 	m := make(map[string][]string, len(types))

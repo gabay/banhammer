@@ -47,7 +47,10 @@ RUN mkdir -p /var/lib/banhammer /run/banhammer \
 # Runs as root by default — see the Docker section of README.md for why and
 # how to drop privileges.
 
-EXPOSE 9777
+# 9777 is the Prometheus endpoint (metrics.listen), 7980 the read-only status
+# page (web.enabled). Both default to loopback in config.example.yaml; set
+# listen: 0.0.0.0:<port> in the mounted config to reach them from the host.
+EXPOSE 9777 7980
 
 # /healthz is only served when metrics.listen is configured; the check is a
 # no-op signal ("unhealthy") otherwise.
