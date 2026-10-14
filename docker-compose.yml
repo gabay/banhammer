@@ -1,0 +1,77 @@
+# Banhammer with a self-refreshing GeoLite2 country database.
+#
+#   cp .env.example .env        # put your MaxMind account ID + license key in
+#   docker compose up -d
+#   open http://127.0.0.1:7980/
+#
+# Three services, one shared volume:
+#
+#   geoip-init    runs MaxMind's official geoipupdate once and exits, so the
+#                 database exists before banhammer starts (banhammer treats a
+#                 missing web.geoip file as a configuration error).
+#   geoip-update  the same image in daemon mode, re-downloading every
+#                 GEOIPUPDATE_FREQUENCY hours. It writes the file atomically;
+#                 banhammer notices the change on its own within a minute and
+#                 reopens it — no reload, no restart.
+#   banhammer     the daemon, reading the database from the shared volume.
+#
+# The license key lives in .env and reaches only the geoipupdate containers;
+# banhammer never sees it, because downloading is not something banhammer
+# does — it only reads the file.
+
+services:
+  geoip-init:
+    image: ghcr.io/maxmind/geoipupdate:v7
+    environment:
+      GEOIPUPDATE_ACCOUNT_ID: ${GEOIPUPDATE_ACCOUNT_ID:?set it in .env}
+      GEOIPUPDATE_LICENSE_KEY: ${GEOIPUPDATE_LICENSE_KEY:?set it in .env}
+      GEOIPUPDATE_EDITION_IDS: GeoLite2-Country
+      GEOIPUPDATE_FREQUENCY: "0" # run once, then exit
+    volumes:
+      - geoip:/usr/share/GeoIP
+    restart: "no"
+
+  geoip-update:
+    image: ghcr.io/maxmind/geoipupdate:v7
+    environment:
+      GEOIPUPDATE_ACCOUNT_ID: ${GEOIPUPDATE_ACCOUNT_ID:?set it in .env}
+      GEOIPUPDATE_LICENSE_KEY: ${GEOIPUPDATE_LICENSE_KEY:?set it in .env}
+      GEOIPUPDATE_EDITION_IDS: GeoLite2-Country
+      # Hours between checks. GeoLite2 is published twice a week; 72 h is
+      # MaxMind's own suggestion and well inside their daily request limit.
+      GEOIPUPDATE_FREQUENCY: "72"
+    volumes:
+      - geoip:/usr/share/GeoIP
+    depends_on:
+      geoip-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  banhammer:
+    build: .
+    # image: ghcr.io/roigabay/banhammer:latest
+    command: ["run", "-c", "/etc/banhammer/config.yaml", "--socket", "/run/banhammer/control.sock"]
+    volumes:
+      - ./config.yaml:/etc/banhammer/config.yaml:ro
+      - geoip:/usr/share/GeoIP:ro
+      - state:/var/lib/banhammer
+      # Mount the logs you monitor, read-only, at the paths your config names:
+      # - /var/log/auth.log:/var/log/auth.log:ro
+    ports:
+      # The status page. Bound to loopback on the host; drop the 127.0.0.1
+      # prefix only behind a reverse proxy that authenticates.
+      - "127.0.0.1:7980:7980"
+    depends_on:
+      geoip-init:
+        condition: service_completed_successfully
+    # Firewall backends need the host network namespace and CAP_NET_ADMIN
+    # (and root inside the container for iptables); `action: dryrun` works
+    # without any of this. Uncomment for real bans:
+    # network_mode: host
+    # cap_add: [NET_ADMIN, NET_RAW]
+    # user: "0:0"
+    restart: unless-stopped
+
+volumes:
+  geoip:
+  state:

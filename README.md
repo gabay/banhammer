@@ -340,7 +340,9 @@ Set `web.geoip` to a country database and the page (and `banhammer status`) gain
 * **MaxMind DB** (`.mmdb`): [GeoLite2-Country](https://dev.maxmind.com/geoip/geolite2-free-geolocation-data) (free with an account; `geoipupdate` keeps it fresh at `/usr/share/GeoIP/GeoLite2-Country.mmdb`), GeoIP2-Country, or the [DB-IP country mmdb](https://db-ip.com/db/download/ip-to-country-lite).
 * **CSV** (`start_ip,end_ip,country_code`, optionally `.gz`): [DB-IP Country Lite](https://db-ip.com/db/download/ip-to-country-lite) or the daily-updated files in [sapics/ip-location-db](https://github.com/sapics/ip-location-db) (e.g. `dbip-country/dbip-country-ipv4.csv` + `-ipv6.csv` concatenated, or `geolite2-country`).
 
-The database is only ever consulted for display. It is never involved in a ban decision, and a missing or corrupt file fails startup with a clear error rather than silently showing nothing. `banhammer reload` reopens the database (so a `geoipupdate` refresh is picked up without a restart) and applies a changed `retention`; changing `listen` needs a restart.
+The database is only ever consulted for display. It is never involved in a ban decision, and a missing or corrupt file fails startup with a clear error rather than silently showing nothing.
+
+**Keeping it fresh is not banhammer's job, noticing is.** Run `geoipupdate` (or the Docker sidecar below) on whatever schedule you like; the daemon stats the file once a minute and reopens it when it has changed, so a refresh is live within a minute with no reload and no restart. A replacement that does not parse is logged once and the previous database is kept. `banhammer reload` also reopens it, and applies a changed `retention`; changing `listen` needs a restart.
 
 ### Offending log lines
 
@@ -416,6 +418,33 @@ monitors:
       - "Failed .* for .* from <IP>"
       - "Invalid user .* from <IP>"
 ```
+
+---
+
+## Docker
+
+The [`Dockerfile`](./Dockerfile) builds a static binary into an Alpine image with `iptables`, `nftables` and `ipset` installed, running unprivileged by default. [`docker-compose.yml`](./docker-compose.yml) is a complete deployment including an automatically refreshed GeoLite2 country database:
+
+```bash
+cp .env.example .env            # MaxMind account ID + license key (free account)
+cp config.example.yaml config.yaml
+docker compose up -d
+open http://127.0.0.1:7980/
+```
+
+```mermaid
+flowchart LR
+    init["geoip-init<br/>(geoipupdate, once)"] -->|writes| vol[("geoip volume<br/>GeoLite2-Country.mmdb")]
+    upd["geoip-update<br/>(geoipupdate, every 72 h)"] -->|rewrites atomically| vol
+    vol -->|read-only, re-read on change| bh["banhammer"]
+    bh --> page["127.0.0.1:7980"]
+```
+
+* **The license key reaches only the `geoipupdate` containers**, via `.env` (git- and docker-ignored). Banhammer has no download code and no key: fetching data is a job for MaxMind's own tool; banhammer only reads the file and reopens it when it changes.
+* `geoip-init` runs once so the file exists before banhammer starts; `geoip-update` keeps it current. `GEOIPUPDATE_FREQUENCY` is in hours — GeoLite2 is published twice a week, so 72 is plenty and stays well inside MaxMind's daily limit.
+* Set `web.geoip: /usr/share/GeoIP/GeoLite2-Country.mmdb` in your `config.yaml` (the path inside the container).
+* Real firewall bans need the host network namespace and `CAP_NET_ADMIN`; the commented lines in the compose file show the flags. `action: dryrun`, the metrics endpoint and the status page work without them.
+* Only `9777` (metrics) and `7980` (status page) are exposed, and the compose file binds the page to the host's loopback.
 
 ---
 

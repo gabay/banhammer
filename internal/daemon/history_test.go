@@ -387,3 +387,66 @@ func TestLineArena(t *testing.T) {
 		t.Error("first copy was overwritten by a chunk roll-over")
 	}
 }
+
+// TestDaemon_GeoIPRefreshedWhenFileChanges: a geoipupdate sidecar (or a
+// cron) replaces the database file; the daemon must notice on its own, no
+// `banhammer reload` required, and must keep the old database while a new
+// file is unreadable.
+func TestDaemon_GeoIPRefreshedWhenFileChanges(t *testing.T) {
+	stateDir := t.TempDir()
+	path := writeTestGeoCSV(t)
+	cfg := baseTestConfig(stateDir)
+	cfg.Web = config.Web{GeoIP: path, Retention: 24 * time.Hour}
+	d, err := New(cfg, WithRunner(&recordingRunner{}), WithStdin(strings.NewReader("")), WithControlSocket(""), WithHistoryInterval(20*time.Millisecond))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer d.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = d.Run(ctx) }()
+	if err := d.Service().Ban(netip.MustParseAddr("192.0.2.10"), "sshd", time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	country := func() string {
+		st, err := d.Service().Status()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return st.History.IPCountries["192.0.2.10"]
+	}
+	if got := country(); got != "DE" {
+		t.Fatalf("before: %q", got)
+	}
+
+	// Replace the file the way geoipupdate does: write aside, rename over.
+	// The mtime is pushed forward explicitly so the test does not depend on
+	// filesystem timestamp granularity.
+	replace := func(content string, mod time.Time) {
+		t.Helper()
+		tmp := path + ".tmp"
+		if err := os.WriteFile(tmp, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(tmp, mod, mod); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(tmp, path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	base := time.Now().Add(time.Hour)
+	replace("192.0.2.0,192.0.2.255,FR\n", base)
+	waitForCondition(t, 3*time.Second, func() bool { return country() == "FR" })
+
+	// A broken replacement is ignored; the previous database stays.
+	replace("not,a,database\n", base.Add(time.Minute))
+	time.Sleep(100 * time.Millisecond) // several refresh ticks; nothing should change
+	if got := country(); got != "FR" {
+		t.Errorf("after a broken rewrite: %q, want FR kept", got)
+	}
+
+	// And a good one after that is picked up again.
+	replace("192.0.2.0,192.0.2.255,IT\n", base.Add(2*time.Minute))
+	waitForCondition(t, 3*time.Second, func() bool { return country() == "IT" })
+}

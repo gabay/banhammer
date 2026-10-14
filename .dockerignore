@@ -27,3 +27,6 @@ coverage.*
 .DS_Store
 .idea/
 .vscode/
+
+# Secrets: the compose file reads this, the image must never contain it
+.env

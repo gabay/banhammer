@@ -87,9 +87,11 @@ type Daemon struct {
 	// because `banhammer status` reports from it whether or not the web page
 	// is on. geo is the optional country database, swapped under geoMu by a
 	// reload that changes web.geoip.
-	ledger *stats.Ledger
-	geoMu  sync.RWMutex
-	geo    geoip.DB
+	ledger   *stats.Ledger
+	geoMu    sync.RWMutex
+	geo      geoip.DB
+	geoPath  string   // the file geo was read from; "" when geography is off
+	geoStamp geoStamp // that file's (mtime, size) when it was read
 	// captureLines mirrors cfg.Web.LogLines for the workers, which read it
 	// on every match and must not take cfgMu to do so.
 	captureLines atomic.Bool
@@ -211,8 +213,9 @@ func New(cfg *config.Config, opts ...Option) (*Daemon, error) {
 	if db, err := openGeo(cfg.Web.GeoIP); err != nil {
 		d.cleanupStoreOnFailure()
 		return nil, fmt.Errorf("daemon: %w", err)
-	} else {
-		d.geo = db
+	} else if db != nil {
+		stamp, _ := stampOf(cfg.Web.GeoIP) // the file was just read; a stat failure here only delays the first refresh
+		d.swapGeo(db, cfg.Web.GeoIP, stamp)
 	}
 
 	// 4. Ban Manager
@@ -491,6 +494,7 @@ waitLoop:
 			_ = d.saveOffsets()
 		case <-historyTicker.C:
 			d.saveHistory()
+			d.refreshGeo()
 		}
 	}
 
@@ -571,12 +575,7 @@ func (d *Daemon) Close() error {
 		if d.store != nil {
 			err = d.store.Close()
 		}
-		d.geoMu.Lock()
-		if d.geo != nil {
-			_ = d.geo.Close()
-			d.geo = nil
-		}
-		d.geoMu.Unlock()
+		d.swapGeo(nil, "", geoStamp{})
 	})
 	return err
 }
@@ -635,6 +634,68 @@ func openGeo(path string) (geoip.DB, error) {
 		return nil, fmt.Errorf("open web.geoip database: %w", err)
 	}
 	return db, nil
+}
+
+// geoStamp identifies a version of the database file. geoipupdate, like this
+// daemon's own store, writes a temp file and renames it into place, so a
+// changed (mtime, size) means a complete new file, never a half-written one.
+type geoStamp struct {
+	mod  time.Time
+	size int64
+}
+
+func stampOf(path string) (geoStamp, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return geoStamp{}, err
+	}
+	return geoStamp{mod: fi.ModTime(), size: fi.Size()}, nil
+}
+
+// swapGeo installs db as the current database, closing the one it replaces.
+// A nil db turns geography off.
+func (d *Daemon) swapGeo(db geoip.DB, path string, stamp geoStamp) {
+	d.geoMu.Lock()
+	old := d.geo
+	d.geo, d.geoPath, d.geoStamp = db, path, stamp
+	d.geoMu.Unlock()
+	if old != nil {
+		_ = old.Close()
+	}
+}
+
+// refreshGeo reopens the database when the file behind it has changed.
+//
+// Watching the file is the daemon's half of keeping GeoIP data fresh: the
+// download is an external job (geoipupdate, a cron, a sidecar container) and
+// none of them can be expected to know about `banhammer reload`. The check
+// is a stat once a minute, on the history tick; the reopen is a few
+// megabytes read and happens a handful of times a week. A file that has
+// gone missing or does not parse keeps the previous database and is logged
+// once per change, not once per minute.
+func (d *Daemon) refreshGeo() {
+	d.geoMu.RLock()
+	path, have := d.geoPath, d.geoStamp
+	d.geoMu.RUnlock()
+	if path == "" {
+		return
+	}
+	now, err := stampOf(path)
+	if err != nil || now == have {
+		return
+	}
+	db, err := openGeo(path)
+	if err != nil {
+		d.log.Warn("web.geoip database changed on disk but cannot be read; keeping the previous one", "path", path, "err", err)
+		// Remember this version so the warning is not repeated every
+		// minute; the next change on disk is checked afresh.
+		d.geoMu.Lock()
+		d.geoStamp = now
+		d.geoMu.Unlock()
+		return
+	}
+	d.swapGeo(db, path, now)
+	d.log.Info("web.geoip database refreshed from disk", "path", path, "modified", now.mod.Format(time.RFC3339))
 }
 
 // syncBanMetrics copies the ban manager's per-monitor counters and source
@@ -839,13 +900,8 @@ func (d *Daemon) Reload(newCfg *config.Config) error {
 		d.log.Error("reload: keeping the previous web.geoip database", "path", newCfg.Web.GeoIP, "err", err)
 		newCfg.Web.GeoIP = oldGeoPath
 	} else {
-		d.geoMu.Lock()
-		old := d.geo
-		d.geo = db // nil when the key was removed
-		d.geoMu.Unlock()
-		if old != nil {
-			_ = old.Close()
-		}
+		stamp, _ := stampOf(newCfg.Web.GeoIP)
+		d.swapGeo(db, newCfg.Web.GeoIP, stamp) // db is nil when the key was removed
 	}
 
 	// Atomically swap effective config

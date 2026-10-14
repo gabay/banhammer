@@ -56,6 +56,11 @@ never learns what a log line is, and both agree on `model.Ban`.
 > `control.Stats` so the daemon can answer `banhammer status` from one place. It means `control`
 > can never import `metrics`; if that ever becomes necessary, move `Stats` down into `model`.
 
+`geoip` reads a file an external job keeps fresh (`geoipupdate`, a cron, the compose sidecar);
+the daemon stats that file on its minute tick and reopens it when it changes, so the download
+side never needs to know about `banhammer reload`. Banhammer itself never downloads anything and
+holds no MaxMind credentials.
+
 `stats` sits just above `model`: it owns the ban ledger and the `Summary` type that `control`
 carries on the status wire. `geoip` is a leaf that imports nothing; it is handed to `stats` as a
 `Lookup` interface and to `web` as a name function, so neither of those packages knows it exists.
