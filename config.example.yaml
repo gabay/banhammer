@@ -48,6 +48,9 @@ allowlist:
 #                                  # sapics/ip-location-db); .csv.gz is fine
 #   retention: 720h                # how long ban events are kept for the statistics
 #                                  # (also what `banhammer status` reports); 30 days
+#   log_lines: true                # keep the log line that triggered each ban (shown on
+#                                  # the page and in `status`); set false if your logs
+#                                  # carry usernames or URLs you would rather not keep
 
 # ---------------------------------------------------------------- monitors
 monitors:

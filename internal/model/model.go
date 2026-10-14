@@ -68,6 +68,18 @@ type BanEvent struct {
 	IP      netip.Addr `json:"ip"`
 	Monitor string     `json:"monitor"`
 	At      time.Time  `json:"at"`
+
+	// Line is the log line that crossed the threshold, or "" when there is
+	// none (a manual ban, capture disabled, or an old event whose line was
+	// dropped to stay within the ledger's byte budget).
+	//
+	// This is the one place attacker-written text is kept, and it is kept
+	// here rather than on Ban on purpose: Ban is substituted into command
+	// templates, a BanEvent only ever reaches a display. The ledger
+	// sanitises the line to printable UTF-8 and bounds its length before
+	// storing it, so a consumer may print it, but should still treat it as
+	// data, never as markup or as a command.
+	Line string `json:"line,omitempty"`
 }
 
 // Event converts a ban into its ledger record.

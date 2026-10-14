@@ -335,7 +335,7 @@ func TestWebDefaults(t *testing.T) {
 	const monitor = "monitors:\n  m:\n    stdin: true\n    match: \"<IP>\"\n"
 
 	c := mustParse(t, monitor)
-	want := Web{Enabled: false, Listen: DefaultWebListen, Retention: DefaultWebRetention}
+	want := Web{Enabled: false, Listen: DefaultWebListen, Retention: DefaultWebRetention, LogLines: true}
 	if c.Web != want {
 		t.Errorf("absent web block: got %+v, want %+v", c.Web, want)
 	}
@@ -346,8 +346,8 @@ func TestWebDefaults(t *testing.T) {
 		t.Errorf("enabled only: got %+v, want %+v", c.Web, want)
 	}
 
-	c = mustParse(t, "web:\n  enabled: true\n  listen: 0.0.0.0:8080\n  geoip: /usr/share/GeoIP/GeoLite2-Country.mmdb\n  retention: 24h\n"+monitor)
-	want = Web{Enabled: true, Listen: "0.0.0.0:8080", GeoIP: "/usr/share/GeoIP/GeoLite2-Country.mmdb", Retention: 24 * time.Hour}
+	c = mustParse(t, "web:\n  enabled: true\n  listen: 0.0.0.0:8080\n  geoip: /usr/share/GeoIP/GeoLite2-Country.mmdb\n  retention: 24h\n  log_lines: false\n"+monitor)
+	want = Web{Enabled: true, Listen: "0.0.0.0:8080", GeoIP: "/usr/share/GeoIP/GeoLite2-Country.mmdb", Retention: 24 * time.Hour, LogLines: false}
 	if c.Web != want {
 		t.Errorf("full block: got %+v, want %+v", c.Web, want)
 	}

@@ -91,6 +91,10 @@ type Web struct {
 	Listen    string        // host:port; default DefaultWebListen
 	GeoIP     string        // path to a country database; empty disables geography
 	Retention time.Duration // how long ban events are kept for statistics; default 30d
+	// LogLines keeps the log line that triggered each ban, for display.
+	// Default true; off is for operators whose logs carry things (usernames,
+	// URLs) they would rather not have on a dashboard or in history.json.
+	LogLines bool
 }
 
 // Settings are the knobs that may appear under `defaults:` or on a monitor.
@@ -311,12 +315,13 @@ func resolve(raw *rawConfig) *Config {
 	if raw.Metrics != nil {
 		setIf(&c.Metrics.Listen, raw.Metrics.Listen)
 	}
-	c.Web = Web{Listen: DefaultWebListen, Retention: DefaultWebRetention}
+	c.Web = Web{Listen: DefaultWebListen, Retention: DefaultWebRetention, LogLines: true}
 	if raw.Web != nil {
 		setIf(&c.Web.Enabled, raw.Web.Enabled)
 		setIf(&c.Web.Listen, raw.Web.Listen)
 		setIf(&c.Web.GeoIP, raw.Web.GeoIP)
 		setDur(&c.Web.Retention, raw.Web.Retention)
+		setIf(&c.Web.LogLines, raw.Web.LogLines)
 	}
 	if len(raw.Allowlist) > 0 {
 		c.Allowlist = make([]netip.Prefix, 0, len(raw.Allowlist))

@@ -27,7 +27,7 @@ func TestStatusCommandHistory(t *testing.T) {
 	ip := netip.MustParseAddr("192.0.2.10")
 	ip2 := netip.MustParseAddr("198.51.100.7")
 	events := []model.BanEvent{
-		{IP: ip, Monitor: "sshd", At: now.Add(-5 * time.Minute)},
+		{IP: ip, Monitor: "sshd", At: now.Add(-5 * time.Minute), Line: "Failed password for root from 192.0.2.10 port 4242 ssh2"},
 		{IP: ip, Monitor: "sshd", At: now.Add(-2 * time.Hour)},
 		{IP: ip2, Monitor: "nginx", At: now.Add(-3 * 24 * time.Hour)},
 	}
@@ -64,6 +64,7 @@ func TestStatusCommandHistory(t *testing.T) {
 			"198.51.100.7", "unknown",
 			"Top countries:",
 			"Last 24h:", "Last 30d:",
+			"    ↳ Failed password for root from 192.0.2.10 port 4242 ssh2",
 		} {
 			if !strings.Contains(stdout, want) {
 				t.Errorf("status output missing %q:\n%s", want, stdout)

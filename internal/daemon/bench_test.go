@@ -149,6 +149,7 @@ func BenchmarkPipeline(b *testing.B) {
 
 	authCorpus := getBenchAuthCorpus()
 	jsonCorpus := getBenchJSONCorpus()
+	var arena lineArena
 
 	b.Run("Daemon_ProcessEvent_AuthLog", func(b *testing.B) {
 		b.ReportAllocs()
@@ -161,7 +162,7 @@ func BenchmarkPipeline(b *testing.B) {
 				Raw:     authCorpus[i%n],
 				Recv:    start,
 			}
-			d.processEvent(ev)
+			d.processEvent(ev, &arena)
 		}
 		elapsed := time.Since(start).Seconds()
 		if elapsed > 0 {
@@ -180,7 +181,31 @@ func BenchmarkPipeline(b *testing.B) {
 				Raw:     jsonCorpus[i%n],
 				Recv:    start,
 			}
-			d.processEvent(ev)
+			d.processEvent(ev, &arena)
+		}
+		elapsed := time.Since(start).Seconds()
+		if elapsed > 0 {
+			b.ReportMetric(float64(b.N)/elapsed, "lines/sec")
+		}
+	})
+
+	// The same auth.log path with offending-line capture on, which is the
+	// shipped default: the per-match copy must stay amortised to roughly
+	// nothing (one allocation per 64 KiB of matched text).
+	b.Run("Daemon_ProcessEvent_AuthLog_CaptureLines", func(b *testing.B) {
+		d.captureLines.Store(true)
+		defer d.captureLines.Store(false)
+		b.ReportAllocs()
+		b.ResetTimer()
+		start := time.Now()
+		n := len(authCorpus)
+		for i := 0; i < b.N; i++ {
+			ev := model.Event{
+				Monitor: "sshd",
+				Raw:     authCorpus[i%n],
+				Recv:    start,
+			}
+			d.processEvent(ev, &arena)
 		}
 		elapsed := time.Since(start).Seconds()
 		if elapsed > 0 {

@@ -50,6 +50,10 @@ td.num,th.num{text-align:right}
 td.ip{font-family:var(--mono)}
 td.mono{font-family:var(--mono);color:var(--muted);max-width:360px;overflow:hidden;text-overflow:ellipsis}
 td.dim{color:var(--muted)}
+tr.line td{padding:0 8px 7px 24px;border-bottom:1px solid var(--line);white-space:normal;color:var(--muted);font-size:12px}
+tr.line td code{font-family:var(--mono);word-break:break-all;color:var(--fg);opacity:.8}
+tr.line td code::before{content:"↳ ";color:var(--muted)}
+tr.hasline td{border-bottom:0}
 .tw{overflow-x:auto}
 .hbars{display:grid;grid-template-columns:auto 1fr auto;gap:6px 10px;align-items:center;font-size:13px}
 .hbars .n{font-variant-numeric:tabular-nums;text-align:right;color:var(--muted)}
@@ -128,8 +132,9 @@ footer{color:var(--muted);font-size:12px;margin-top:18px;display:flex;flex-wrap:
   {{if not .Offenders}}<p class="empty">No bans recorded yet.</p>{{else}}
   <div class="tw"><table>
     <tr><th>Address</th>{{if $.GeoEnabled}}<th>Country</th>{{end}}<th class="num">Bans</th><th>Last banned</th><th>Monitors</th></tr>
-    {{range .Offenders}}<tr><td class="ip">{{.IP}}</td>{{if $.GeoEnabled}}<td>{{if .Flag}}<span class="flag">{{.Flag}}</span> {{end}}{{if .Country}}{{.Country}}{{else}}{{.Code}}{{end}}</td>{{end}}<td class="num">{{n .Bans}}</td><td>{{.LastAt}} <span class="pill">{{.LastAgo}}</span></td><td class="dim">{{.Monitors}}</td></tr>
-    {{end}}
+    {{range .Offenders}}<tr{{if .Line}} class="hasline"{{end}}><td class="ip">{{.IP}}</td>{{if $.GeoEnabled}}<td>{{if .Flag}}<span class="flag">{{.Flag}}</span> {{end}}{{if .Country}}{{.Country}}{{else}}{{.Code}}{{end}}</td>{{end}}<td class="num">{{n .Bans}}</td><td>{{.LastAt}} <span class="pill">{{.LastAgo}}</span></td><td class="dim">{{.Monitors}}</td></tr>
+    {{if .Line}}<tr class="line"><td colspan="5"><code>{{.Line}}</code></td></tr>
+    {{end}}{{end}}
   </table></div>{{end}}
 </section>
 {{end}}
@@ -139,8 +144,9 @@ footer{color:var(--muted);font-size:12px;margin-top:18px;display:flex;flex-wrap:
   {{if not .Bans}}<p class="empty">Nobody is banned right now.</p>{{else}}
   <div class="tw"><table>
     <tr><th>Address</th>{{if .GeoEnabled}}<th>Country</th>{{end}}<th>Monitor</th><th class="num">Offense</th><th class="num">Hits</th><th>Banned at</th><th>Expires</th><th>Rule</th></tr>
-    {{range .Bans}}<tr><td class="ip">{{.IP}}</td>{{if $.GeoEnabled}}<td>{{if .Flag}}<span class="flag">{{.Flag}}</span> {{end}}{{if .Country}}{{.Country}}{{else}}{{.Code}}{{end}}</td>{{end}}<td>{{.Monitor}}</td><td class="num">{{.Offense}}</td><td class="num">{{.Count}}</td><td>{{.At}}</td><td>{{.Expires}}</td><td class="mono" title="{{.Matched}}">{{.Matched}}</td></tr>
-    {{end}}
+    {{range .Bans}}<tr{{if .Line}} class="hasline"{{end}}><td class="ip">{{.IP}}</td>{{if $.GeoEnabled}}<td>{{if .Flag}}<span class="flag">{{.Flag}}</span> {{end}}{{if .Country}}{{.Country}}{{else}}{{.Code}}{{end}}</td>{{end}}<td>{{.Monitor}}</td><td class="num">{{.Offense}}</td><td class="num">{{.Count}}</td><td>{{.At}}</td><td>{{.Expires}}</td><td class="mono" title="{{.Matched}}">{{.Matched}}</td></tr>
+    {{if .Line}}<tr class="line"><td colspan="8"><code>{{.Line}}</code></td></tr>
+    {{end}}{{end}}
   </table></div>
   {{if .BansOmitted}}<p class="empty">… and {{n .BansOmitted}} more, by expiry. The full list is at <code>/status.json</code> and in <code>banhammer status</code>.</p>{{end}}{{end}}
 </section>

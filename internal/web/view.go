@@ -106,6 +106,7 @@ type offenderRow struct {
 	LastAt   string
 	LastAgo  string
 	Monitors string
+	Line     string // most recent offending log line, "" if none
 }
 
 type banRow struct {
@@ -119,6 +120,7 @@ type banRow struct {
 	At      string
 	Expires string
 	Matched string
+	Line    string // the log line that triggered the ban, "" if none
 }
 
 // maxBanRows bounds the active-bans table. An ipset deployment can hold
@@ -148,6 +150,12 @@ func buildView(resp control.StatusResponse, now time.Time, loc *time.Location, r
 			return ""
 		}
 		return h.IPCountries[ip]
+	}
+	lineOf := func(ip string) string {
+		if h == nil {
+			return ""
+		}
+		return h.Samples[ip].Line
 	}
 	label := func(code string) (flag, name string) {
 		switch code {
@@ -273,6 +281,7 @@ func buildView(resp control.StatusResponse, now time.Time, loc *time.Location, r
 				LastAt:   fmtTime(o.LastAt.In(loc)),
 				LastAgo:  humanDuration(now.Sub(o.LastAt)) + " ago",
 				Monitors: strings.Join(o.Monitors, ", "),
+				Line:     lineOf(o.IP.String()),
 			})
 		}
 	}
@@ -306,6 +315,7 @@ func buildView(resp control.StatusResponse, now time.Time, loc *time.Location, r
 			At:      fmtTime(b.At.In(loc)),
 			Expires: expires,
 			Matched: b.Matched,
+			Line:    lineOf(ip),
 		})
 	}
 	return v

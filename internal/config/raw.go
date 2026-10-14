@@ -41,6 +41,7 @@ type rawWeb struct {
 	Listen    *string   `yaml:"listen"`
 	GeoIP     *string   `yaml:"geoip"`
 	Retention *duration `yaml:"retention"`
+	LogLines  *bool     `yaml:"log_lines"`
 }
 
 // rawSettings is the set of knobs valid both under `defaults:` and directly on

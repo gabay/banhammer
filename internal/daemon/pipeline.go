@@ -22,10 +22,54 @@ import (
 // aggregator. pattern is the rule that fired, carried through to the ban record
 // for the {matched} action variable; it is a compile-time constant string, so
 // passing it costs no allocation on the hot path.
+//
+// line is a copy of the matching log line, or nil when capture is off. Only
+// the aggregator knows whether a hit is the one that bans, and by then the
+// source's buffer is long gone, so the copy has to be made here, for every
+// match. It is made into a lineArena so that it costs an allocation per
+// 64 KiB of matched text rather than per line; the aggregator must not keep
+// the slice past the iteration that received it.
 type matchEvent struct {
 	monitor string
 	ip      netip.Addr
 	pattern string
+	line    []byte
+}
+
+// lineArena hands out immutable copies of log lines from large chunks.
+//
+// Each worker owns one. A chunk is only ever appended to, never rewritten,
+// and each copy is returned with its capacity clipped, so a slice handed to
+// the aggregator cannot be changed by the worker's later appends and the
+// aggregator cannot append into the worker's chunk. When a chunk fills, a
+// new one is allocated; the old one lives until the last copy into it is
+// dropped, which the aggregator does on the next loop iteration. Copies
+// start on an 8-byte boundary so that no two of them share a word, which
+// keeps the race detector's word-granular shadow memory honest.
+type lineArena struct {
+	chunk []byte
+}
+
+const (
+	arenaChunkSize = 64 << 10
+	// arenaMaxLine caps what is copied. The ledger truncates to
+	// stats.MaxLineBytes anyway; copying more would be waste the attacker
+	// controls.
+	arenaMaxLine = 512
+)
+
+func (a *lineArena) copyLine(raw []byte) []byte {
+	if len(raw) > arenaMaxLine {
+		raw = raw[:arenaMaxLine]
+	}
+	// Round the write position up to a multiple of 8.
+	start := (len(a.chunk) + 7) &^ 7
+	if start+len(raw) > cap(a.chunk) {
+		a.chunk = make([]byte, 0, arenaChunkSize)
+		start = 0
+	}
+	a.chunk = append(a.chunk[:start], raw...)
+	return a.chunk[start:len(a.chunk):len(a.chunk)]
 }
 
 // enqueue offers ev to the worker queue, dropping the oldest queued event when
@@ -77,12 +121,13 @@ func (d *Daemon) closeQueue() {
 
 func (d *Daemon) worker() {
 	defer d.workerWg.Done()
+	var arena lineArena
 	for ev := range d.queue {
-		d.processEvent(ev)
+		d.processEvent(ev, &arena)
 	}
 }
 
-func (d *Daemon) processEvent(ev model.Event) {
+func (d *Daemon) processEvent(ev model.Event, arena *lineArena) {
 	set := d.getRuleSet(ev.Monitor)
 	if set == nil {
 		d.metrics.IncLinesRead(ev.Monitor)
@@ -93,7 +138,11 @@ func (d *Daemon) processEvent(ev model.Event) {
 	switch outcome {
 	case rule.OutcomeMatch:
 		d.metrics.IncMatches(ev.Monitor)
-		d.matchCh <- matchEvent{monitor: ev.Monitor, ip: res.IP, pattern: res.Pattern}
+		m := matchEvent{monitor: ev.Monitor, ip: res.IP, pattern: res.Pattern}
+		if d.captureLines.Load() {
+			m.line = arena.copyLine(ev.Raw)
+		}
+		d.matchCh <- m
 	case rule.OutcomeDecodeError:
 		d.metrics.IncDecodeErrors(ev.Monitor)
 	}
@@ -130,6 +179,10 @@ func (d *Daemon) aggregator() {
 				// Further hits from a banned address change nothing, so stop
 				// paying for its counter until it comes back.
 				tr.Forget(m.ip)
+				if m.line != nil {
+					// Observe copies; m.line is not referenced after this.
+					d.ledger.Observe(m.ip, m.line)
+				}
 				d.banManager.Offend(m.monitor, m.ip, count, m.pattern)
 			}
 			d.metrics.SetTrackedIPs(m.monitor, int64(tr.Len()))

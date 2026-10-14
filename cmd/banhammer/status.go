@@ -89,6 +89,16 @@ func newStatusCmd(root *rootFlags) *cobra.Command {
 					fmt.Fprintf(w, "  %s\t%s\t%d\t%d\t%s\t%s\n",
 						b.IP, b.Monitor, b.Offense, b.Count,
 						b.At.Format("2006-01-02 15:04:05"), expiresIn)
+					// The offending line goes on its own row, outside the
+					// column grid: it is long, and a tab in it would be
+					// read by tabwriter as a cell boundary. The ledger has
+					// already replaced control characters, so it is safe
+					// to print to a terminal.
+					if resp.History != nil {
+						if s, ok := resp.History.Samples[b.IP.String()]; ok {
+							fmt.Fprintf(w, "    ↳ %s\n", s.Line)
+						}
+					}
 				}
 				w.Flush()
 			}

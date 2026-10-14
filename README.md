@@ -302,6 +302,7 @@ web:
   listen: 127.0.0.1:7980         # default
   geoip: /usr/share/GeoIP/GeoLite2-Country.mmdb   # optional
   retention: 720h                # default: 30 days
+  log_lines: true                # default: keep the line that triggered each ban
 ```
 
 Then open <http://127.0.0.1:7980/>.
@@ -317,8 +318,8 @@ Then open <http://127.0.0.1:7980/>.
 | Hour-of-day and day-of-week distribution, in the daemon's local time zone | ledger |
 | Countries of the active bans and of the last 30 days | ledger + GeoIP database |
 | Per-monitor table: tracked IPs, active, 24h / 7d / 30d | live + ledger |
-| Repeat offenders: most-banned addresses, last ban, which monitors caught them | ledger |
-| Active bans with country, offense number, hit count, expiry and the rule that fired | live ban table |
+| Repeat offenders: most-banned addresses, last ban, which monitors caught them, and the latest log line that got them banned | ledger |
+| Active bans with country, offense number, hit count, expiry, the rule that fired and **the log line that triggered the ban** | live ban table + ledger |
 
 The same data is available as JSON at `/status.json` (identical to `banhammer status --json`), and `/healthz` answers `200 ok` for liveness probes.
 
@@ -341,9 +342,17 @@ Set `web.geoip` to a country database and the page (and `banhammer status`) gain
 
 The database is only ever consulted for display. It is never involved in a ban decision, and a missing or corrupt file fails startup with a clear error rather than silently showing nothing. `banhammer reload` reopens the database (so a `geoipupdate` refresh is picked up without a restart) and applies a changed `retention`; changing `listen` needs a restart.
 
+### Offending log lines
+
+For every ban the pipeline issues, the log line that crossed the threshold is kept and shown under the ban (and under each repeat offender, and as `↳ …` in `banhammer status`). Manual bans have none. A few things are worth knowing:
+
+* **It is attacker-written text, treated as such.** Lines are reduced to printable UTF-8 (control characters, including terminal escapes, become `�`) and cut at 512 bytes *before* they are stored, so they are safe to print in a terminal; the page additionally HTML-escapes them. They never enter `model.Ban`, so they can never reach an action's command line.
+* **It is cheap.** Only matching lines are copied, into a per-worker 64 KiB arena, so the cost is one allocation per 64 KiB of matched text; the non-matching path stays allocation-free. Lines are capped at 4 MiB in total: beyond that the oldest events keep their counts and drop their text.
+* **It is optional.** Logs can carry usernames, URLs or e-mail addresses. Set `web.log_lines: false` (reloadable) and nothing is captured or written to `history.json`.
+
 ### The ledger
 
-Ban events are kept in memory (64 bytes each, capped at 100 000 events regardless of `retention`) and persisted to `<state_dir>/history.json` once a minute when anything changed, and at shutdown, so a restart does not blank the charts. Like the other state files it is replaceable: a corrupt file is set aside as `history.json.corrupt` and the daemon starts with an empty ledger. Only *new* bans are recorded — a ban re-applied at startup, or extended while live, does not count twice.
+Ban events are kept in memory (64 bytes each plus the log line, capped at 100 000 events regardless of `retention`) and persisted to `<state_dir>/history.json` once a minute when anything changed, and at shutdown, so a restart does not blank the charts. Like the other state files it is replaceable: a corrupt file is set aside as `history.json.corrupt` and the daemon starts with an empty ledger. Only *new* bans are recorded — a ban re-applied at startup, or extended while live, does not count twice.
 
 The page shows at most 500 active bans (soonest to expire first) and says how many more there are; `/status.json` and `banhammer status` always list all of them.
 

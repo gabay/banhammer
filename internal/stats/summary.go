@@ -89,6 +89,18 @@ type Summary struct {
 	// top offenders to its country code, so a renderer can label rows
 	// without a database of its own.
 	IPCountries map[string]string `json:"ip_countries,omitempty"`
+	// Samples maps each address in the active bans or the top offenders to
+	// the most recent log line that got it banned, when the ledger has one.
+	Samples map[string]Sample `json:"samples,omitempty"`
+}
+
+// Sample is one offending log line, already sanitised by the ledger (see
+// SanitizeLine): printable UTF-8, at most MaxLineBytes, no control
+// characters. Still attacker-written text; render it as text.
+type Sample struct {
+	Line    string    `json:"line"`
+	Monitor string    `json:"monitor"`
+	At      time.Time `json:"at"`
 }
 
 // Window is the ban count over one trailing period.
@@ -331,6 +343,34 @@ func Summarize(events []model.BanEvent, active []model.Ban, now time.Time, o Sum
 		for i := range s.TopOffenders {
 			s.TopOffenders[i].Monitors = slices.Sorted(maps.Keys(topMonitors[s.TopOffenders[i].IP]))
 		}
+	}
+
+	// --- samples -------------------------------------------------------
+	// The newest line per address, for the addresses someone will look at.
+	// Chosen by timestamp, not by position: the ledger keeps events in time
+	// order, but Summarize promises not to depend on it.
+	wanted := make(map[netip.Addr]struct{}, len(active)+len(s.TopOffenders))
+	for _, b := range active {
+		wanted[b.IP] = struct{}{}
+	}
+	for _, o := range s.TopOffenders {
+		wanted[o.IP] = struct{}{}
+	}
+	for _, e := range events {
+		if e.Line == "" {
+			continue
+		}
+		if _, want := wanted[e.IP]; !want {
+			continue
+		}
+		key := e.IP.String()
+		if cur, ok := s.Samples[key]; ok && !e.At.After(cur.At) {
+			continue
+		}
+		if s.Samples == nil {
+			s.Samples = make(map[string]Sample)
+		}
+		s.Samples[key] = Sample{Line: e.Line, Monitor: e.Monitor, At: e.At}
 	}
 
 	// --- geography -----------------------------------------------------

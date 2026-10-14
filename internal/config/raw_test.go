@@ -143,7 +143,7 @@ func TestKnownKeysMatchStructTags(t *testing.T) {
 		},
 		"config.rawMetrics": {"listen"},
 		"config.rawAction":  {"ban", "chain", "flush_on_exit", "name", "shell", "start", "stop", "timeout", "unban"},
-		"config.rawWeb":     {"enabled", "geoip", "listen", "retention"},
+		"config.rawWeb":     {"enabled", "geoip", "listen", "log_lines", "retention"},
 	}
 
 	got := keyIndex()

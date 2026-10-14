@@ -3,6 +3,7 @@ package stats
 import (
 	"net/netip"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -569,5 +570,167 @@ func TestLedgerSetRetention(t *testing.T) {
 	}
 	if got := l.Snapshot(); len(got) != 1 || got[0].IP != addr(t, "2.2.2.2") {
 		t.Errorf("shrinking retention must prune at once; got %+v", got)
+	}
+}
+
+// --- log lines -----------------------------------------------------------
+
+func TestSanitizeLine(t *testing.T) {
+	t.Parallel()
+	long := strings.Repeat("a", MaxLineBytes+10)
+	for _, tc := range []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"empty", "", ""},
+		{"plain", "Failed password for root from 1.2.3.4 port 22 ssh2", "Failed password for root from 1.2.3.4 port 22 ssh2"},
+		{"unicode", "Benutzer «Jürgen» — 日本", "Benutzer «Jürgen» — 日本"},
+		{"escape sequence", "evil\x1b[2J\x1b]0;pwned\x07", "evil\uFFFD[2J\uFFFD]0;pwned\uFFFD"},
+		{"tab and newline", "a\tb\nc\r", "a\uFFFDb\uFFFDc\uFFFD"},
+		{"invalid utf8", "ok\xff\xfe", "ok\uFFFD\uFFFD"},
+		{"truncated", long, strings.Repeat("a", MaxLineBytes) + "…"},
+		{"truncated mid-rune", strings.Repeat("a", MaxLineBytes-1) + "日本", strings.Repeat("a", MaxLineBytes-1) + "\uFFFD…"},
+	} {
+		if got := SanitizeLine([]byte(tc.in)); got != tc.want {
+			t.Errorf("%s: SanitizeLine = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+	// The output is always valid UTF-8 with no control characters.
+	out := SanitizeLine([]byte("\x00\x01\x7f\xc0\xaf"))
+	for _, r := range out {
+		if r != '\uFFFD' {
+			t.Errorf("unexpected rune %q in %q", r, out)
+		}
+	}
+}
+
+func TestObserveFeedsNextRecordForSameAddress(t *testing.T) {
+	t.Parallel()
+	l, _ := newTestLedger(Options{})
+	ip, other := addr(t, "203.0.113.5"), addr(t, "203.0.113.6")
+
+	l.Observe(ip, []byte("Failed password for root from 203.0.113.5"))
+	l.Record(ban(t, "203.0.113.5", "sshd", epoch))
+	// A second record for the same address without a new Observe: no line.
+	l.Record(ban(t, "203.0.113.5", "sshd", epoch.Add(time.Minute)))
+	// A line observed for one address does not attach to another.
+	l.Observe(ip, []byte("another line"))
+	l.Record(ban(t, "203.0.113.6", "sshd", epoch.Add(2*time.Minute)))
+	// An IPv4-mapped observation matches the unmapped ban address.
+	l.Observe(netip.AddrFrom16(ip.As16()), []byte("mapped"))
+	l.Record(ban(t, "203.0.113.5", "sshd", epoch.Add(3*time.Minute)))
+
+	got := l.Snapshot()
+	want := []string{"Failed password for root from 203.0.113.5", "", "", "mapped"}
+	if len(got) != len(want) {
+		t.Fatalf("Snapshot = %+v", got)
+	}
+	for i, w := range want {
+		if got[i].Line != w {
+			t.Errorf("event %d line = %q, want %q", i, got[i].Line, w)
+		}
+	}
+	_ = other
+}
+
+func TestObserveCopiesTheBuffer(t *testing.T) {
+	t.Parallel()
+	l, _ := newTestLedger(Options{})
+	buf := []byte("original")
+	l.Observe(addr(t, "1.1.1.1"), buf)
+	copy(buf, "mutated!")
+	l.Record(ban(t, "1.1.1.1", "m", epoch))
+	if got := l.Snapshot()[0].Line; got != "original" {
+		t.Errorf("Observe aliased the caller's buffer: %q", got)
+	}
+}
+
+func TestLedgerLineBudgetBlanksOldestLines(t *testing.T) {
+	t.Parallel()
+	line := strings.Repeat("x", 100)
+	l, _ := newTestLedger(Options{MaxLineTotal: 250}) // room for two lines
+	for i := range 4 {
+		ip := netip.AddrFrom4([4]byte{10, 0, 0, byte(i)})
+		l.Observe(ip, []byte(line))
+		l.Record(model.Ban{IP: ip, Monitor: "m", At: epoch.Add(time.Duration(i) * time.Minute)})
+	}
+	got := l.Snapshot()
+	if len(got) != 4 {
+		t.Fatalf("events = %d, want 4: the budget drops lines, never events", len(got))
+	}
+	for i, e := range got {
+		hasLine := e.Line != ""
+		if wantLine := i >= 2; hasLine != wantLine {
+			t.Errorf("event %d has line %v, want %v", i, hasLine, wantLine)
+		}
+	}
+	if l.lineBytes != 200 {
+		t.Errorf("lineBytes = %d, want 200", l.lineBytes)
+	}
+
+	// Pruning the front keeps the accounting straight.
+	l.SetRetention(2*time.Minute + 30*time.Second)
+	l.now = func() time.Time { return epoch.Add(4 * time.Minute) }
+	got = l.Snapshot() // prunes events at 0m and 1m (both blank)
+	if len(got) != 2 || got[0].Line == "" || l.lineBytes != 200 || l.linesFrom != 0 {
+		t.Errorf("after prune: %d events, lineBytes %d, linesFrom %d", len(got), l.lineBytes, l.linesFrom)
+	}
+}
+
+func TestLedgerRestoreSanitisesAndCountsLines(t *testing.T) {
+	t.Parallel()
+	l, _ := newTestLedger(Options{MaxLineTotal: 30})
+	l.Restore([]model.BanEvent{
+		{IP: addr(t, "1.1.1.1"), Monitor: "m", At: epoch.Add(-3 * time.Minute), Line: strings.Repeat("o", 20)},
+		{IP: addr(t, "2.2.2.2"), Monitor: "m", At: epoch.Add(-2 * time.Minute), Line: "esc\x1b[31m"},
+		{IP: addr(t, "3.3.3.3"), Monitor: "m", At: epoch.Add(-time.Minute), Line: strings.Repeat("n", 20)},
+	})
+	got := l.Snapshot()
+	if got[0].Line != "" {
+		t.Errorf("oldest line should have been dropped for the budget, got %q", got[0].Line)
+	}
+	if got[1].Line != "esc\uFFFD[31m" {
+		t.Errorf("hand-edited line was not sanitised: %q", got[1].Line)
+	}
+	if got[2].Line == "" {
+		t.Error("newest line lost")
+	}
+}
+
+func TestSummarizeSamples(t *testing.T) {
+	t.Parallel()
+	ip, ip2, ip3 := addr(t, "1.1.1.1"), addr(t, "2.2.2.2"), addr(t, "3.3.3.3")
+	ev := []model.BanEvent{
+		{IP: ip, Monitor: "sshd", At: epoch.Add(-3 * time.Hour), Line: "old line"},
+		{IP: ip, Monitor: "nginx", At: epoch.Add(-time.Hour), Line: "newest line"},
+		{IP: ip, Monitor: "sshd", At: epoch.Add(-time.Minute)}, // no line (budget or manual)
+		{IP: ip2, Monitor: "sshd", At: epoch.Add(-time.Minute), Line: "two"},
+		{IP: ip3, Monitor: "sshd", At: epoch.Add(-time.Minute), Line: "not wanted"},
+	}
+	active := []model.Ban{ban(t, "1.1.1.1", "sshd", epoch), ban(t, "9.9.9.9", "manual", epoch)}
+	s := Summarize(ev, active, epoch, SummaryOptions{Location: time.UTC, TopN: 2})
+
+	if got := s.Samples[ip.String()]; got.Line != "newest line" || got.Monitor != "nginx" || !got.At.Equal(epoch.Add(-time.Hour)) {
+		t.Errorf("sample for %s = %+v, want the newest event that has a line", ip, got)
+	}
+	if _, ok := s.Samples["9.9.9.9"]; ok {
+		t.Error("an address with no events must have no sample")
+	}
+	// ip2 is a top offender (TopN 2: ip with 3, then a tie) — whichever of
+	// ip2/ip3 made the list has a sample; the one that did not, does not.
+	for _, o := range s.TopOffenders {
+		if _, ok := s.Samples[o.IP.String()]; !ok {
+			t.Errorf("top offender %s has no sample", o.IP)
+		}
+	}
+	if len(s.Samples) != 1+len(s.TopOffenders)-1 { // ip counted once in both
+		t.Errorf("Samples = %v", s.Samples)
+	}
+
+	// No lines anywhere: the map is absent, not empty.
+	s = Summarize([]model.BanEvent{{IP: ip, Monitor: "m", At: epoch}}, nil, epoch, SummaryOptions{Location: time.UTC})
+	if s.Samples != nil {
+		t.Errorf("Samples = %v, want nil", s.Samples)
 	}
 }

@@ -51,8 +51,8 @@ func sampleStatus(t *testing.T) control.StatusResponse {
 	ip := netip.MustParseAddr("203.0.113.9")
 	ip6 := netip.MustParseAddr("2001:db8::1")
 	events := []model.BanEvent{
-		{IP: ip, Monitor: "sshd", At: epoch.Add(-10 * time.Minute)},
-		{IP: ip, Monitor: "sshd", At: epoch.Add(-3 * time.Hour)},
+		{IP: ip, Monitor: "sshd", At: epoch.Add(-10 * time.Minute), Line: `Failed password for <b>root</b> from 203.0.113.9 "><img src=x onerror=alert(1)>`},
+		{IP: ip, Monitor: "sshd", At: epoch.Add(-3 * time.Hour), Line: "older line"},
 		{IP: ip6, Monitor: "<script>alert(1)</script>", At: epoch.Add(-2 * 24 * time.Hour)},
 	}
 	active := []model.Ban{
@@ -127,6 +127,8 @@ func TestIndexRendersEverySection(t *testing.T) {
 		"/var/log/auth.log",
 		"in 50m",                             // expiry of the first ban
 		"Failed password .* from &lt;IP&gt;", // rule, escaped
+		`<tr class="line"><td colspan="8"><code>Failed password for &lt;b&gt;root&lt;/b&gt;`, // log line under the ban, escaped
+		`<tr class="line"><td colspan="5"><code>Failed password for &lt;b&gt;root&lt;/b&gt;`, // and under the offender
 		"2 firewall action(s) failed",
 		"4 log line(s) were dropped",
 		"read-only",
@@ -152,6 +154,12 @@ func TestIndexEscapesAttackerStrings(t *testing.T) {
 	}
 	if strings.Contains(body, `" onload="`) {
 		t.Fatal("unescaped attribute breakout reached the page")
+	}
+	if strings.Contains(body, "<img") || strings.Contains(body, "onerror=alert") && !strings.Contains(body, "onerror=alert(1)&gt;") {
+		t.Fatal("the hostile log line reached the page as markup")
+	}
+	if strings.Count(body, "older line") != 0 {
+		t.Error("only the newest line per address should be shown")
 	}
 	// The template must not contain a single <script> of its own either.
 	if strings.Contains(strings.ToLower(pageSource), "<script") {

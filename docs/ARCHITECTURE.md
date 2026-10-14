@@ -115,6 +115,18 @@ Anything that must outlive the call has to be copied; the pipeline is built so t
 **`model.Ban.Matched` is operator data, not attacker data.** It carries the rule *pattern* that
 fired, never the log line. Actions substitute it into `{matched}`, and `bans.json` persists it.
 
+**Log text lives in `model.BanEvent.Line` and nowhere else.** The line that crossed the threshold
+is captured for display — on the status page and in `banhammer status` — but it never touches
+`model.Ban`, so it can never reach a command template. It travels worker → aggregator as a copy
+(see `lineArena` in `daemon/pipeline.go`: one allocation per 64 KiB of matched text, not per
+line, and nothing on the non-matching path), and reaches the ledger through
+`stats.Ledger.Observe` immediately before `ban.Manager.Offend`, so the ban manager never sees it.
+The ledger sanitises every line to printable UTF-8 of bounded length before storing it, and
+re-sanitises what it loads from `history.json`; a terminal escape in a log file comes out as
+`U+FFFD`, not as a cleared screen. Lines are bounded in total (`stats.DefaultMaxLineTotal`): past
+the budget the *oldest* events keep their counts and lose their text. `web.log_lines: false`
+turns capture off for logs that carry things an operator would rather not keep.
+
 **Prefilter soundness.** `rule` may skip a regex only when a required literal is absent from the
 line. If a prefilter ever rejects a line the regex would have matched, that is a missed ban, so
 the property is fuzz-tested rather than merely unit-tested.

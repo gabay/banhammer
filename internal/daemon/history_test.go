@@ -293,3 +293,97 @@ func TestDaemon_LastMinuteBanReachesHistory(t *testing.T) {
 		t.Fatalf("history.json after shutdown = %+v, want the last-minute ban", events)
 	}
 }
+
+// TestDaemon_BanCarriesOffendingLine: the line that crossed the threshold
+// reaches the ledger and the status response; a manual ban has no line;
+// with web.log_lines off nothing is captured at all. The ban record itself
+// never carries log text in either case.
+func TestDaemon_BanCarriesOffendingLine(t *testing.T) {
+	for _, capture := range []bool{true, false} {
+		t.Run(map[bool]string{true: "on", false: "off"}[capture], func(t *testing.T) {
+			stateDir := t.TempDir()
+			cfg := baseTestConfig(stateDir)
+			cfg.Web = config.Web{Retention: 24 * time.Hour, LogLines: capture}
+			runner := &recordingRunner{}
+			// Every line carries an escape sequence to prove sanitisation
+			// happens on this path. Which of the three is kept is not
+			// defined: workers run in parallel, so the hit that crosses
+			// the threshold at the aggregator may be any of them.
+			input := "Failed password for invalid user admin from 192.0.2.10 port 1\x1b[2J\n" +
+				"Failed password for invalid user admin from 192.0.2.10 port 2\x1b[2J\n" +
+				"Failed password for root from 192.0.2.10 port 3 ssh2\x1b[2J\n"
+			d, err := New(cfg, WithRunner(runner), WithStdin(strings.NewReader(input)), WithControlSocket(""))
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			defer d.Close()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			go func() { _ = d.Run(ctx) }()
+			waitForCondition(t, 3*time.Second, func() bool { return runner.HasArg("192.0.2.10") })
+			if err := d.Service().Ban(netip.MustParseAddr("192.0.2.99"), "manual", time.Hour); err != nil {
+				t.Fatal(err)
+			}
+
+			st, err := d.Service().Status()
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, b := range st.Bans {
+				if strings.Contains(b.Matched, "Failed password for root") {
+					t.Fatalf("log text leaked into model.Ban.Matched: %q", b.Matched)
+				}
+			}
+			sample, ok := st.History.Samples["192.0.2.10"]
+			if capture {
+				if !ok {
+					t.Fatalf("no sample for the banned address: %+v", st.History.Samples)
+				}
+				if !strings.HasPrefix(sample.Line, "Failed password for ") || !strings.HasSuffix(sample.Line, "\uFFFD[2J") || strings.ContainsRune(sample.Line, 0x1b) || sample.Monitor != "sshd" {
+					t.Errorf("sample = %+v, want one of the input lines, sanitised", sample)
+				}
+			} else if ok || st.History.Samples != nil {
+				t.Errorf("log_lines off, yet samples = %+v", st.History.Samples)
+			}
+			if _, ok := st.History.Samples["192.0.2.99"]; ok {
+				t.Error("a manual ban must not have a log line")
+			}
+		})
+	}
+}
+
+// TestLineArena pins the aliasing contract: a copy is unaffected by later
+// copies, cannot be appended into the chunk, and lines start on 8-byte
+// boundaries.
+func TestLineArena(t *testing.T) {
+	t.Parallel()
+	var a lineArena
+	first := a.copyLine([]byte("first line"))
+	second := a.copyLine([]byte("second"))
+	if string(first) != "first line" || string(second) != "second" {
+		t.Fatalf("copies = %q %q", first, second)
+	}
+	if cap(first) != len(first) {
+		t.Errorf("copy has spare capacity %d; a receiver could append into the chunk", cap(first)-len(first))
+	}
+	// "first line" is 10 bytes; the next copy must start at offset 16 so
+	// that the worker's later appends never touch a word the aggregator
+	// may be reading.
+	if &a.chunk[:cap(a.chunk)][16] != &second[0] {
+		t.Error("second copy is not 8-byte aligned after the first")
+	}
+	// Fill a chunk: copies stay valid across the roll-over.
+	long := bytes.Repeat([]byte("x"), arenaMaxLine*2)
+	var keep [][]byte
+	for range arenaChunkSize/arenaMaxLine + 5 {
+		keep = append(keep, a.copyLine(long))
+	}
+	for i, k := range keep {
+		if len(k) != arenaMaxLine || k[0] != 'x' || k[len(k)-1] != 'x' {
+			t.Fatalf("copy %d corrupted or not truncated: len %d", i, len(k))
+		}
+	}
+	if string(first) != "first line" {
+		t.Error("first copy was overwritten by a chunk roll-over")
+	}
+}

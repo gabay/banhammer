@@ -90,6 +90,9 @@ type Daemon struct {
 	ledger *stats.Ledger
 	geoMu  sync.RWMutex
 	geo    geoip.DB
+	// captureLines mirrors cfg.Web.LogLines for the workers, which read it
+	// on every match and must not take cfgMu to do so.
+	captureLines atomic.Bool
 
 	rulesMu sync.RWMutex
 	rules   map[string]*rule.Set
@@ -204,6 +207,7 @@ func New(cfg *config.Config, opts ...Option) (*Daemon, error) {
 	// opened before the ban manager exists because a bad path is a config
 	// error and should fail startup, like a bad backend does.
 	d.ledger = stats.NewLedger(stats.Options{Retention: cfg.Web.Retention, Now: d.now})
+	d.captureLines.Store(cfg.Web.LogLines)
 	if db, err := openGeo(cfg.Web.GeoIP); err != nil {
 		d.cleanupStoreOnFailure()
 		return nil, fmt.Errorf("daemon: %w", err)
@@ -597,6 +601,13 @@ func (d *Daemon) saveHistory() {
 	}
 	if err := d.store.SaveHistory(events); err != nil {
 		d.ledger.MarkDirty()
+		if errors.Is(err, store.ErrClosed) {
+			// Close raced the shutdown sequence; there is nothing to retry
+			// into, and a warning would send someone looking for a disk
+			// problem that does not exist.
+			d.log.Debug("ban history not saved: store already closed", "events", len(events))
+			return
+		}
 		d.log.Warn("saving ban history failed; will retry", "err", err, "events", len(events))
 	}
 }
@@ -818,6 +829,7 @@ func (d *Daemon) Reload(newCfg *config.Config) error {
 	// refreshes GeoLite2 in place, and `banhammer reload` is how an
 	// operator picks that up without a restart.
 	d.ledger.SetRetention(newCfg.Web.Retention)
+	d.captureLines.Store(newCfg.Web.LogLines)
 	d.cfgMu.RLock()
 	oldGeoPath := d.cfg.Web.GeoIP
 	d.cfgMu.RUnlock()
