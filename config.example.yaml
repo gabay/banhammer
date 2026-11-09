@@ -38,7 +38,7 @@ allowlist:
 
 # web:                             # read-only status page with ban statistics
 #   enabled: true                  # off by default
-#   listen: 127.0.0.1:7980         # default; use 0.0.0.0:7980 to reach it from elsewhere
+#   listen: 127.0.0.1:7890         # default; use 0.0.0.0:7890 to reach it from elsewhere
 #                                  # (the page lists banned addresses and watched log
 #                                  # paths — put a reverse proxy with auth in front)
 #   geoip: /usr/share/GeoIP/GeoLite2-Country.mmdb

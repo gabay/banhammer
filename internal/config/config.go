@@ -46,7 +46,7 @@ const (
 	// banned address and every watched log path, which is reconnaissance for
 	// anyone who can reach it. Exposing it is a decision the operator makes by
 	// writing an address down.
-	DefaultWebListen = "127.0.0.1:7980"
+	DefaultWebListen = "127.0.0.1:7890"
 	// DefaultWebRetention is how far back the ban ledger behind the status
 	// page remembers. Thirty days is the longest window the page reports.
 	DefaultWebRetention = 30 * 24 * time.Hour

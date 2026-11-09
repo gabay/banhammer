@@ -230,6 +230,54 @@ monitors:
 		}
 	})
 
+	t.Run("ConfigFromEnv", func(t *testing.T) {
+		cfgContent := `
+state_dir: /tmp/banhammer-test
+monitors:
+  sshd:
+    file: /var/log/auth.log
+    match: "Failed password .* from <IP>"
+`
+		tmpDir := t.TempDir()
+		cfgPath := filepath.Join(tmpDir, "config.yaml")
+		if err := os.WriteFile(cfgPath, []byte(cfgContent), 0600); err != nil {
+			t.Fatal(err)
+		}
+
+		t.Setenv("CONFIG", cfgPath)
+		stdout, _, err := executeCommand("check")
+		if err != nil {
+			t.Fatalf("check failed unexpectedly with CONFIG env: %v", err)
+		}
+		if !strings.Contains(stdout, "sshd") {
+			t.Fatalf("expected output to contain monitor sshd, got: %s", stdout)
+		}
+	})
+
+	t.Run("FlagOverridesEnv", func(t *testing.T) {
+		validCfg := `
+state_dir: /tmp/banhammer-test
+monitors:
+  sshd:
+    file: /var/log/auth.log
+    match: "Failed password .* from <IP>"
+`
+		tmpDir := t.TempDir()
+		validPath := filepath.Join(tmpDir, "valid.yaml")
+		if err := os.WriteFile(validPath, []byte(validCfg), 0600); err != nil {
+			t.Fatal(err)
+		}
+
+		t.Setenv("CONFIG", "/path/to/nonexistent/from/env.yaml")
+		stdout, _, err := executeCommand("check", "-c", validPath)
+		if err != nil {
+			t.Fatalf("expected flag to override invalid CONFIG env: %v", err)
+		}
+		if !strings.Contains(stdout, "sshd") {
+			t.Fatalf("expected output to contain monitor sshd, got: %s", stdout)
+		}
+	})
+
 	t.Run("NonexistentFile", func(t *testing.T) {
 		_, _, err := executeCommand("check", "-c", "/path/to/nonexistent/config.yaml")
 		if err == nil {

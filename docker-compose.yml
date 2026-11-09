@@ -2,7 +2,7 @@
 #
 #   cp .env.example .env        # put your MaxMind account ID + license key in
 #   docker compose up -d
-#   open http://127.0.0.1:7980/
+#   open http://127.0.0.1:7890/
 #
 # Three services, one shared volume:
 #
@@ -60,7 +60,7 @@ services:
     ports:
       # The status page. Bound to loopback on the host; drop the 127.0.0.1
       # prefix only behind a reverse proxy that authenticates.
-      - "127.0.0.1:7980:7980"
+      - "127.0.0.1:7890:7890"
     depends_on:
       geoip-init:
         condition: service_completed_successfully

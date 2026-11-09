@@ -34,7 +34,7 @@ func NewRootCmd() *cobra.Command {
 		Version:      version,
 	}
 
-	rootCmd.PersistentFlags().StringVarP(&flags.config, "config", "c", "", "path to configuration file")
+	rootCmd.PersistentFlags().StringVarP(&flags.config, "config", "c", os.Getenv("CONFIG"), "path to configuration file")
 	rootCmd.PersistentFlags().StringVar(&flags.socket, "socket", "", "override control unix socket path")
 
 	rootCmd.AddCommand(newRunCmd(flags))

@@ -299,13 +299,13 @@ Banhammer keeps a bounded **ban ledger** — every ban it issues, for the last 3
 ```yaml
 web:
   enabled: true                  # off by default
-  listen: 127.0.0.1:7980         # default
+  listen: 127.0.0.1:7890         # default
   geoip: /usr/share/GeoIP/GeoLite2-Country.mmdb   # optional
   retention: 720h                # default: 30 days
   log_lines: true                # default: keep the line that triggered each ban
 ```
 
-Then open <http://127.0.0.1:7980/>.
+Then open <http://127.0.0.1:7890/>.
 
 ![Status page](docs/status-page.png)
 
@@ -331,7 +331,7 @@ The page is designed to be safe to leave running on a security daemon:
 * **Only `GET` and `HEAD`** are answered; every other method gets `405`. Unknown paths get `404`.
 * A strict `Content-Security-Policy` (`default-src 'none'`) plus `X-Frame-Options: DENY`, `nosniff`, `Referrer-Policy: no-referrer` and `Cache-Control: no-store` on every response. All dynamic values pass through `html/template`.
 * Rendered output is cached for one second, so a request flood costs one status snapshot per second, not one per request.
-* **Loopback by default.** The page lists every banned address and every watched log path, which is useful reconnaissance; it binds to `127.0.0.1` unless you say otherwise. To reach it from elsewhere, set `listen: 0.0.0.0:7980` and put it behind a reverse proxy that handles TLS and authentication, or tunnel to it (`ssh -L 7980:127.0.0.1:7980 host`).
+* **Loopback by default.** The page lists every banned address and every watched log path, which is useful reconnaissance; it binds to `127.0.0.1` unless you say otherwise. To reach it from elsewhere, set `listen: 0.0.0.0:7890` and put it behind a reverse proxy that handles TLS and authentication, or tunnel to it (`ssh -L 7890:127.0.0.1:7890 host`).
 
 ### Geography (optional)
 
@@ -429,7 +429,7 @@ The [`Dockerfile`](./Dockerfile) builds a static binary into an Alpine image wit
 cp .env.example .env            # MaxMind account ID + license key (free account)
 cp config.example.yaml config.yaml
 docker compose up -d
-open http://127.0.0.1:7980/
+open http://127.0.0.1:7890/
 ```
 
 ```mermaid
@@ -437,14 +437,14 @@ flowchart LR
     init["geoip-init<br/>(geoipupdate, once)"] -->|writes| vol[("geoip volume<br/>GeoLite2-Country.mmdb")]
     upd["geoip-update<br/>(geoipupdate, every 72 h)"] -->|rewrites atomically| vol
     vol -->|read-only, re-read on change| bh["banhammer"]
-    bh --> page["127.0.0.1:7980"]
+    bh --> page["127.0.0.1:7890"]
 ```
 
 * **The license key reaches only the `geoipupdate` containers**, via `.env` (git- and docker-ignored). Banhammer has no download code and no key: fetching data is a job for MaxMind's own tool; banhammer only reads the file and reopens it when it changes.
 * `geoip-init` runs once so the file exists before banhammer starts; `geoip-update` keeps it current. `GEOIPUPDATE_FREQUENCY` is in hours — GeoLite2 is published twice a week, so 72 is plenty and stays well inside MaxMind's daily limit.
 * Set `web.geoip: /usr/share/GeoIP/GeoLite2-Country.mmdb` in your `config.yaml` (the path inside the container).
 * Real firewall bans need the host network namespace and `CAP_NET_ADMIN`; the commented lines in the compose file show the flags. `action: dryrun`, the metrics endpoint and the status page work without them.
-* Only `9777` (metrics) and `7980` (status page) are exposed, and the compose file binds the page to the host's loopback.
+* Only `9777` (metrics) and `7890` (status page) are exposed, and the compose file binds the page to the host's loopback.
 
 ---
 
