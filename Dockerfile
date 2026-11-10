@@ -27,7 +27,7 @@ COPY --from=builder /bin/banhammer /usr/local/bin/banhammer
 
 # Ship a config so `docker run <image>` starts instead of exiting immediately
 # on a missing file. Mount your own over /etc/banhammer/config.yaml.
-COPY config.example.yaml /etc/banhammer/config.yaml
+COPY config.example.yaml /etc/banhammer/banhammer.yaml
 
 # Set up default directories for state and configuration
 RUN mkdir -p /var/lib/banhammer /run/banhammer \
@@ -46,6 +46,6 @@ EXPOSE 9777 7890
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD banhammer status
 
-ENV CONFIG=/etc/banhammer/config.yaml
+ENV CONFIG=/etc/banhammer/banhammer.yaml
 ENTRYPOINT ["banhammer"]
 CMD ["run"]
